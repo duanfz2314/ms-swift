@@ -15,11 +15,10 @@ anchor_type:
 """
 
 import json
-import os
-import tempfile
-from hashlib import md5
 from typing import Any, Optional, Tuple
 
+import numpy as np
+import torch
 from PIL import Image, ImageDraw
 
 from swift.template import register_template
@@ -129,84 +128,112 @@ def _load_image_flexible(image: Any) -> Image.Image:
     return Template._load_image(image, load_images=True)
 
 
-def _apply_anchor_to_video_path(video_path: str, anchor: Any, anchor_type: int) -> Any:
-    """Best-effort local video processing; fallback to source path on errors."""
-    if not isinstance(video_path, str) or not os.path.isfile(video_path):
-        return video_path
-    try:
-        import imageio.v3 as iio
-    except Exception:
-        logger.warning_once('imageio is unavailable, skip video anchor processing.')
-        return video_path
-    try:
-        frames = iio.imread(video_path)
-        if getattr(frames, 'ndim', 0) != 4:
-            return video_path
-    except Exception as e:
-        logger.warning_once(f'Failed reading video for anchors, fallback. err={e}')
-        return video_path
+def _is_channel_last_video(arr: Any) -> bool:
+    return arr.ndim == 4 and arr.shape[-1] in (1, 3, 4)
 
-    h, w = frames.shape[1], frames.shape[2]
-    box = _normalize_anchor(anchor, w, h)
+
+def _is_channel_first_video(arr: Any) -> bool:
+    return arr.ndim == 4 and arr.shape[1] in (1, 3, 4)
+
+
+def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: int) -> np.ndarray:
+    if video.ndim != 4:
+        return video
+    channel_last = _is_channel_last_video(video)
+    if not channel_last and not _is_channel_first_video(video):
+        return video
+
+    if channel_last:
+        height, width = video.shape[1], video.shape[2]
+    else:
+        height, width = video.shape[2], video.shape[3]
+    box = _normalize_anchor(anchor, width, height)
     if box is None:
-        return video_path
+        return video
     x1, y1, x2, y2 = box
 
     if anchor_type == 1:
-        frames = frames[:, y1:y2, x1:x2, :]
-    elif anchor_type == 2:
-        out_frames = []
-        for frame in frames:
-            img = Image.fromarray(frame)
-            draw = ImageDraw.Draw(img)
-            line_width = max(2, min(img.width, img.height) // 200)
-            draw.rectangle(box, outline='red', width=line_width)
-            out_frames.append(img)
-        frames = out_frames
+        if channel_last:
+            return np.ascontiguousarray(video[:, y1:y2, x1:x2, :])
+        return np.ascontiguousarray(video[:, :, y1:y2, x1:x2])
+    if anchor_type != 2:
+        return video
+
+    out = []
+    for frame in video:
+        if channel_last:
+            frame_hwc = frame
+        else:
+            frame_hwc = np.transpose(frame, (1, 2, 0))
+        frame_hwc = np.asarray(frame_hwc, dtype=np.uint8)
+        img = Image.fromarray(frame_hwc)
+        draw = ImageDraw.Draw(img)
+        line_width = max(2, min(img.width, img.height) // 200)
+        draw.rectangle((x1, y1, x2, y2), outline='red', width=line_width)
+        frame_out = np.asarray(img)
+        if not channel_last:
+            frame_out = np.transpose(frame_out, (2, 0, 1))
+        out.append(frame_out)
+    return np.ascontiguousarray(np.stack(out, axis=0))
+
+
+def _apply_anchor_to_torch_video(video: torch.Tensor, anchor: Any, anchor_type: int) -> torch.Tensor:
+    if video.ndim != 4:
+        return video
+    channel_last = _is_channel_last_video(video)
+    if not channel_last and not _is_channel_first_video(video):
+        return video
+
+    if channel_last:
+        height, width = video.shape[1], video.shape[2]
     else:
-        return video_path
+        height, width = video.shape[2], video.shape[3]
+    box = _normalize_anchor(anchor, int(width), int(height))
+    if box is None:
+        return video
+    x1, y1, x2, y2 = box
 
-    try:
-        meta = iio.immeta(video_path)
-        fps = int(meta.get('fps', 25)) if isinstance(meta, dict) else 25
-    except Exception:
-        fps = 25
+    if anchor_type == 1:
+        if channel_last:
+            return video[:, y1:y2, x1:x2, :]
+        return video[:, :, y1:y2, x1:x2]
+    if anchor_type != 2:
+        return video
 
-    digest = md5(
-        f'{video_path}|{anchor_type}|{json.dumps(anchor, ensure_ascii=False, sort_keys=True)}'.encode('utf-8')
-    ).hexdigest()[:10]
-    out_dir = os.path.join(tempfile.gettempdir(), 'swift_anchor_media')
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f'{os.path.basename(video_path)}.{digest}.mp4')
-    if not os.path.exists(out_path):
-        try:
-            iio.imwrite(out_path, frames, fps=fps)
-        except Exception as e:
-            logger.warning_once(f'Failed writing processed video, fallback. err={e}')
-            return video_path
-    return out_path
+    video_np = video.detach().cpu().numpy()
+    out_np = _apply_anchor_to_numpy_video(video_np, anchor, anchor_type)
+    out = torch.from_numpy(out_np).to(video.device)
+    if out.dtype != video.dtype:
+        out = out.to(video.dtype)
+    return out
 
 
 def _apply_anchor_to_video(video: Any, anchor: Any, anchor_type: int) -> Any:
     if anchor_type == 0:
         return video
+    if isinstance(video, torch.Tensor):
+        return _apply_anchor_to_torch_video(video, anchor, anchor_type)
+    if isinstance(video, np.ndarray):
+        return _apply_anchor_to_numpy_video(video, anchor, anchor_type)
     if isinstance(video, (list, tuple)) and video:
-        # Video represented by frames.
+        # Video represented by frame list.
         processed = []
         for frame in video:
             try:
                 img = _load_image_flexible(frame)
                 img = _apply_anchor_to_image_obj(img, anchor, anchor_type)
-                processed.append(img)
+                processed.append(np.asarray(img))
             except Exception:
                 processed.append(frame)
         return processed
-    return _apply_anchor_to_video_path(video, anchor, anchor_type)
+    return video
 
 
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     def replace_tag(self, media_type, index, inputs):
+        anchor = None
+        anchor_type = 0
         if media_type in {'image', 'video'}:
             anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
             anchor_type = _to_int(anchor_type_raw, default=0)
@@ -219,15 +246,17 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 if media_type == 'image':
                     image = _load_image_flexible(inputs.images[index])
                     inputs.images[index] = _apply_anchor_to_image_obj(image, anchor, anchor_type)
-                else:
-                    inputs.videos[index] = _apply_anchor_to_video(inputs.videos[index], anchor, anchor_type)
 
             # Optional pass-through for custom downstream processors.
             if anchor is not None:
                 inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
                 inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
 
-        return super().replace_tag(media_type, index, inputs)
+        contexts = super().replace_tag(media_type, index, inputs)
+        if media_type == 'video' and anchor is not None and anchor_type in {1, 2}:
+            # Apply anchor operations on extracted in-memory frames/tensors.
+            inputs.videos[index] = _apply_anchor_to_video(inputs.videos[index], anchor, anchor_type)
+        return contexts
 
     def _encode(self, inputs):
         # Fallback if processor does not accept custom anchor kwargs.
