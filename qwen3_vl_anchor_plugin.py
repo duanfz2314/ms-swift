@@ -74,6 +74,31 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _parse_shape_wh(shape: Any) -> Optional[Tuple[int, int]]:
+    shape = _json_loads_maybe(shape)
+    if shape is None:
+        return None
+    if isinstance(shape, dict):
+        if 'shape' in shape:
+            shape = shape['shape']
+        elif 'size' in shape:
+            shape = shape['size']
+        elif 'w' in shape and 'h' in shape:
+            shape = [shape['w'], shape['h']]
+        elif 'width' in shape and 'height' in shape:
+            shape = [shape['width'], shape['height']]
+    if not isinstance(shape, (list, tuple)) or len(shape) < 2:
+        return None
+    try:
+        w = int(shape[0])
+        h = int(shape[1])
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return w, h
+
+
 def _normalize_anchor(anchor: Any, width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
     if anchor is None:
         return None
@@ -110,20 +135,41 @@ def _normalize_anchor(anchor: Any, width: int, height: int) -> Optional[Tuple[in
     return x1, y1, x2, y2
 
 
+def _rescale_box(box: Tuple[int, int, int, int], src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int, int, int]:
+    if src_w <= 0 or src_h <= 0:
+        return box
+    x1, y1, x2, y2 = box
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    nx1 = int(round(x1 * sx))
+    ny1 = int(round(y1 * sy))
+    nx2 = int(round(x2 * sx))
+    ny2 = int(round(y2 * sy))
+    nx1 = max(0, min(nx1, dst_w - 1))
+    ny1 = max(0, min(ny1, dst_h - 1))
+    nx2 = max(1, min(nx2, dst_w))
+    ny2 = max(1, min(ny2, dst_h))
+    return nx1, ny1, nx2, ny2
+
+
 def _apply_anchor_to_image_obj(image: Image.Image,
                                anchor: Any,
                                anchor_type: int,
                                *,
+                               shape_wh: Optional[Tuple[int, int]] = None,
                                resize_after_crop: bool = False,
                                resize_target: Optional[Tuple[int, int]] = None) -> Image.Image:
-    orig_w, orig_h = image.width, image.height
-    box = _normalize_anchor(anchor, image.width, image.height)
+    curr_w, curr_h = image.width, image.height
+    anchor_ref_w, anchor_ref_h = shape_wh or (curr_w, curr_h)
+    box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h)
     if box is None:
         return image
+    if (anchor_ref_w, anchor_ref_h) != (curr_w, curr_h):
+        box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     if anchor_type == 1:
         image = image.crop(box)
         if resize_after_crop:
-            target_w, target_h = resize_target or (orig_w, orig_h)
+            target_w, target_h = resize_target or (curr_w, curr_h)
             image = image.resize((target_w, target_h), Image.BICUBIC)
         return image
     if anchor_type == 2:
@@ -146,7 +192,11 @@ def _is_channel_first_video(arr: Any) -> bool:
     return arr.ndim == 4 and arr.shape[1] in (1, 3, 4)
 
 
-def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: int) -> np.ndarray:
+def _apply_anchor_to_numpy_video(video: np.ndarray,
+                                 anchor: Any,
+                                 anchor_type: int,
+                                 *,
+                                 shape_wh: Optional[Tuple[int, int]] = None) -> np.ndarray:
     if video.ndim != 4:
         return video
     channel_last = _is_channel_last_video(video)
@@ -154,12 +204,15 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
         return video
 
     if channel_last:
-        height, width = video.shape[1], video.shape[2]
+        curr_h, curr_w = video.shape[1], video.shape[2]
     else:
-        height, width = video.shape[2], video.shape[3]
-    box = _normalize_anchor(anchor, width, height)
+        curr_h, curr_w = video.shape[2], video.shape[3]
+    anchor_ref_w, anchor_ref_h = shape_wh or (curr_w, curr_h)
+    box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h)
     if box is None:
         return video
+    if (anchor_ref_w, anchor_ref_h) != (curr_w, curr_h):
+        box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     x1, y1, x2, y2 = box
 
     if anchor_type not in (1, 2):
@@ -177,8 +230,9 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
             img,
             anchor,
             anchor_type,
+            shape_wh=(curr_w, curr_h),
             resize_after_crop=(anchor_type == 1),
-            resize_target=(width, height))
+            resize_target=(curr_w, curr_h))
         frame_out = np.asarray(img)
         if not channel_last:
             frame_out = np.transpose(frame_out, (2, 0, 1))
@@ -186,26 +240,34 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
     return np.ascontiguousarray(np.stack(out, axis=0))
 
 
-def _apply_anchor_to_torch_video(video: torch.Tensor, anchor: Any, anchor_type: int) -> torch.Tensor:
+def _apply_anchor_to_torch_video(video: torch.Tensor,
+                                 anchor: Any,
+                                 anchor_type: int,
+                                 *,
+                                 shape_wh: Optional[Tuple[int, int]] = None) -> torch.Tensor:
     if video.ndim != 4:
         return video
     if anchor_type not in (1, 2):
         return video
     video_np = video.detach().cpu().numpy()
-    out_np = _apply_anchor_to_numpy_video(video_np, anchor, anchor_type)
+    out_np = _apply_anchor_to_numpy_video(video_np, anchor, anchor_type, shape_wh=shape_wh)
     out = torch.from_numpy(out_np).to(video.device)
     if out.dtype != video.dtype:
         out = out.to(video.dtype)
     return out
 
 
-def _apply_anchor_to_video(video: Any, anchor: Any, anchor_type: int) -> Any:
+def _apply_anchor_to_video(video: Any,
+                           anchor: Any,
+                           anchor_type: int,
+                           *,
+                           shape_wh: Optional[Tuple[int, int]] = None) -> Any:
     if anchor_type == 0:
         return video
     if isinstance(video, torch.Tensor):
-        return _apply_anchor_to_torch_video(video, anchor, anchor_type)
+        return _apply_anchor_to_torch_video(video, anchor, anchor_type, shape_wh=shape_wh)
     if isinstance(video, np.ndarray):
-        return _apply_anchor_to_numpy_video(video, anchor, anchor_type)
+        return _apply_anchor_to_numpy_video(video, anchor, anchor_type, shape_wh=shape_wh)
     if isinstance(video, (list, tuple)) and video:
         # Video represented by frame list.
         processed = []
@@ -216,8 +278,9 @@ def _apply_anchor_to_video(video: Any, anchor: Any, anchor_type: int) -> Any:
                     img,
                     anchor,
                     anchor_type,
+                    shape_wh=shape_wh,
                     resize_after_crop=(anchor_type == 1),
-                    resize_target=(img.width, img.height))
+                    resize_target=shape_wh or (img.width, img.height))
                 processed.append(np.asarray(img))
             except Exception:
                 processed.append(frame)
@@ -252,11 +315,18 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 anchor_type = 0
 
             anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
+            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
+            shape_wh = _parse_shape_wh(shape_raw)
             if anchor is not None and anchor_type in {1, 2}:
                 if media_type == 'image':
                     image = _load_image_flexible(inputs.images[index])
                     inputs.images[index] = _apply_anchor_to_image_obj(
-                        image, anchor, anchor_type, resize_after_crop=(anchor_type == 1))
+                        image,
+                        anchor,
+                        anchor_type,
+                        shape_wh=shape_wh,
+                        resize_after_crop=(anchor_type == 1),
+                        resize_target=shape_wh)
 
             # Optional pass-through for custom downstream processors.
             if anchor is not None:
@@ -265,8 +335,11 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
         contexts = super().replace_tag(media_type, index, inputs)
         if media_type == 'video' and anchor is not None and anchor_type in {1, 2}:
+            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
+            shape_wh = _parse_shape_wh(shape_raw)
             # Apply anchor ops on extracted in-memory frames/tensors.
-            inputs.videos[index] = _apply_anchor_to_video(inputs.videos[index], anchor, anchor_type)
+            inputs.videos[index] = _apply_anchor_to_video(
+                inputs.videos[index], anchor, anchor_type, shape_wh=shape_wh)
             # Metadata from pre-edit frames may be stale; clear for downstream re-processing.
             _sync_video_metadata(inputs, index)
         return contexts
