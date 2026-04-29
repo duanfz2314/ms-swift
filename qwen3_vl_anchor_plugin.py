@@ -110,12 +110,22 @@ def _normalize_anchor(anchor: Any, width: int, height: int) -> Optional[Tuple[in
     return x1, y1, x2, y2
 
 
-def _apply_anchor_to_image_obj(image: Image.Image, anchor: Any, anchor_type: int) -> Image.Image:
+def _apply_anchor_to_image_obj(image: Image.Image,
+                               anchor: Any,
+                               anchor_type: int,
+                               *,
+                               resize_after_crop: bool = False,
+                               resize_target: Optional[Tuple[int, int]] = None) -> Image.Image:
+    orig_w, orig_h = image.width, image.height
     box = _normalize_anchor(anchor, image.width, image.height)
     if box is None:
         return image
     if anchor_type == 1:
-        return image.crop(box)
+        image = image.crop(box)
+        if resize_after_crop:
+            target_w, target_h = resize_target or (orig_w, orig_h)
+            image = image.resize((target_w, target_h), Image.BICUBIC)
+        return image
     if anchor_type == 2:
         image = image.copy()
         draw = ImageDraw.Draw(image)
@@ -152,11 +162,7 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
         return video
     x1, y1, x2, y2 = box
 
-    if anchor_type == 1:
-        if channel_last:
-            return np.ascontiguousarray(video[:, y1:y2, x1:x2, :])
-        return np.ascontiguousarray(video[:, :, y1:y2, x1:x2])
-    if anchor_type != 2:
+    if anchor_type not in (1, 2):
         return video
 
     out = []
@@ -167,9 +173,12 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
             frame_hwc = np.transpose(frame, (1, 2, 0))
         frame_hwc = np.asarray(frame_hwc, dtype=np.uint8)
         img = Image.fromarray(frame_hwc)
-        draw = ImageDraw.Draw(img)
-        line_width = max(2, min(img.width, img.height) // 200)
-        draw.rectangle((x1, y1, x2, y2), outline='red', width=line_width)
+        img = _apply_anchor_to_image_obj(
+            img,
+            anchor,
+            anchor_type,
+            resize_after_crop=(anchor_type == 1),
+            resize_target=(width, height))
         frame_out = np.asarray(img)
         if not channel_last:
             frame_out = np.transpose(frame_out, (2, 0, 1))
@@ -180,26 +189,8 @@ def _apply_anchor_to_numpy_video(video: np.ndarray, anchor: Any, anchor_type: in
 def _apply_anchor_to_torch_video(video: torch.Tensor, anchor: Any, anchor_type: int) -> torch.Tensor:
     if video.ndim != 4:
         return video
-    channel_last = _is_channel_last_video(video)
-    if not channel_last and not _is_channel_first_video(video):
+    if anchor_type not in (1, 2):
         return video
-
-    if channel_last:
-        height, width = video.shape[1], video.shape[2]
-    else:
-        height, width = video.shape[2], video.shape[3]
-    box = _normalize_anchor(anchor, int(width), int(height))
-    if box is None:
-        return video
-    x1, y1, x2, y2 = box
-
-    if anchor_type == 1:
-        if channel_last:
-            return video[:, y1:y2, x1:x2, :]
-        return video[:, :, y1:y2, x1:x2]
-    if anchor_type != 2:
-        return video
-
     video_np = video.detach().cpu().numpy()
     out_np = _apply_anchor_to_numpy_video(video_np, anchor, anchor_type)
     out = torch.from_numpy(out_np).to(video.device)
@@ -221,12 +212,31 @@ def _apply_anchor_to_video(video: Any, anchor: Any, anchor_type: int) -> Any:
         for frame in video:
             try:
                 img = _load_image_flexible(frame)
-                img = _apply_anchor_to_image_obj(img, anchor, anchor_type)
+                img = _apply_anchor_to_image_obj(
+                    img,
+                    anchor,
+                    anchor_type,
+                    resize_after_crop=(anchor_type == 1),
+                    resize_target=(img.width, img.height))
                 processed.append(np.asarray(img))
             except Exception:
                 processed.append(frame)
         return processed
     return video
+
+
+def _sync_video_metadata(inputs, index: int) -> None:
+    """Remove stale video metadata after in-memory frame edits.
+
+    Qwen3-VL (v3) stores `video_metadata` during `replace_tag(fetch_video)`.
+    Once we crop/resize frames in memory, old metadata can become inconsistent.
+    We clear it and let the later processor call in `_encode` consume updated frames.
+    """
+    mm_kwargs = inputs.mm_processor_kwargs
+    video_metadata = mm_kwargs.get('video_metadata', None)
+    if video_metadata is not None:
+        # Avoid mixing stale/new entries across multi-video samples after frame edits.
+        mm_kwargs.pop('video_metadata', None)
 
 
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
@@ -245,7 +255,8 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             if anchor is not None and anchor_type in {1, 2}:
                 if media_type == 'image':
                     image = _load_image_flexible(inputs.images[index])
-                    inputs.images[index] = _apply_anchor_to_image_obj(image, anchor, anchor_type)
+                    inputs.images[index] = _apply_anchor_to_image_obj(
+                        image, anchor, anchor_type, resize_after_crop=(anchor_type == 1))
 
             # Optional pass-through for custom downstream processors.
             if anchor is not None:
@@ -254,8 +265,10 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
         contexts = super().replace_tag(media_type, index, inputs)
         if media_type == 'video' and anchor is not None and anchor_type in {1, 2}:
-            # Apply anchor operations on extracted in-memory frames/tensors.
+            # Apply anchor ops on extracted in-memory frames/tensors.
             inputs.videos[index] = _apply_anchor_to_video(inputs.videos[index], anchor, anchor_type)
+            # Metadata from pre-edit frames may be stale; clear for downstream re-processing.
+            _sync_video_metadata(inputs, index)
         return contexts
 
     def _encode(self, inputs):
