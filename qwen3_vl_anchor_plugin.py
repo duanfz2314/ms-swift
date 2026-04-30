@@ -304,6 +304,18 @@ def _sync_video_metadata(inputs, index: int) -> None:
 
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
+    @staticmethod
+    def _get_shape_wh(inputs, media_type: str, index: int) -> Optional[Tuple[int, int]]:
+        # Explicit keys requested by user.
+        if media_type == 'image':
+            shape_raw = _pick_media_value(inputs.extra_kwargs.get('image_shape'), media_type, index)
+        else:
+            shape_raw = _pick_media_value(inputs.extra_kwargs.get('video_shape'), media_type, index)
+        if shape_raw is None:
+            # backward compatibility fallback
+            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
+        return _parse_shape_wh(shape_raw)
+
     def replace_tag(self, media_type, index, inputs):
         anchor = None
         anchor_type = 0
@@ -316,14 +328,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 anchor_type = 0
 
             anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
-            if media_type == 'image':
-                shape_raw = _pick_media_value(inputs.extra_kwargs.get('image_shape'), media_type, index)
-            else:
-                shape_raw = _pick_media_value(inputs.extra_kwargs.get('video_shape'), media_type, index)
-            if shape_raw is None:
-                # backward compatibility fallback
-                shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
-            shape_wh = _parse_shape_wh(shape_raw)
+            shape_wh = self._get_shape_wh(inputs, media_type, index)
 
             # Optional pass-through for custom downstream processors.
             if anchor is not None:
