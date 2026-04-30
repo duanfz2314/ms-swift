@@ -307,6 +307,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
     def replace_tag(self, media_type, index, inputs):
         anchor = None
         anchor_type = 0
+        shape_wh = None
         if media_type in {'image', 'video'}:
             anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
             anchor_type = _to_int(anchor_type_raw, default=0)
@@ -315,18 +316,14 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 anchor_type = 0
 
             anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
-            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
+            if media_type == 'image':
+                shape_raw = _pick_media_value(inputs.extra_kwargs.get('image_shape'), media_type, index)
+            else:
+                shape_raw = _pick_media_value(inputs.extra_kwargs.get('video_shape'), media_type, index)
+            if shape_raw is None:
+                # backward compatibility fallback
+                shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
             shape_wh = _parse_shape_wh(shape_raw)
-            if anchor is not None and anchor_type in {1, 2}:
-                if media_type == 'image':
-                    image = _load_image_flexible(inputs.images[index])
-                    inputs.images[index] = _apply_anchor_to_image_obj(
-                        image,
-                        anchor,
-                        anchor_type,
-                        shape_wh=shape_wh,
-                        resize_after_crop=(anchor_type == 1),
-                        resize_target=shape_wh)
 
             # Optional pass-through for custom downstream processors.
             if anchor is not None:
@@ -334,9 +331,16 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
 
         contexts = super().replace_tag(media_type, index, inputs)
+        if media_type == 'image' and anchor is not None and anchor_type in {1, 2}:
+            image = _load_image_flexible(inputs.images[index])
+            inputs.images[index] = _apply_anchor_to_image_obj(
+                image,
+                anchor,
+                anchor_type,
+                shape_wh=shape_wh,
+                resize_after_crop=(anchor_type == 1),
+                resize_target=shape_wh)
         if media_type == 'video' and anchor is not None and anchor_type in {1, 2}:
-            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
-            shape_wh = _parse_shape_wh(shape_raw)
             # Apply anchor ops on extracted in-memory frames/tensors.
             inputs.videos[index] = _apply_anchor_to_video(
                 inputs.videos[index], anchor, anchor_type, shape_wh=shape_wh)
