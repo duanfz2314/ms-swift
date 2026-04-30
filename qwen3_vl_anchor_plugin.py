@@ -74,17 +74,6 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _anchor_format_from_extra(extra_kwargs: Any) -> str:
-    fmt = _json_loads_maybe(extra_kwargs.get('anchor_format', 'auto'))
-    if fmt is None:
-        return 'auto'
-    fmt = str(fmt).strip().lower()
-    if fmt not in {'auto', 'xyxy', 'xywh', 'cxcywh'}:
-        logger.warning_once(f'Unsupported anchor_format={fmt}, fallback to auto.')
-        return 'auto'
-    return fmt
-
-
 def _parse_shape_wh(shape: Any) -> Optional[Tuple[int, int]]:
     shape = _json_loads_maybe(shape)
     if shape is None:
@@ -134,26 +123,9 @@ def _normalize_anchor(anchor: Any,
     except Exception:
         return None
 
-    if anchor_format in {'xywh', 'cxcywh'}:
-        if anchor_format == 'xywh':
-            x1, y1 = a, b
-            x2, y2 = a + c, b + d
-        else:
-            x1, y1 = a - c / 2, b - d / 2
-            x2, y2 = a + c / 2, b + d / 2
-    else:
-        x1, y1, x2, y2 = a, b, c, d
-
-    # auto mode heuristic: if declared xyxy but looks like xywh/cxcywh, convert.
-    if anchor_format == 'auto' and (x2 <= x1 or y2 <= y1):
-        # Try xywh
-        tx1, ty1, tx2, ty2 = a, b, a + c, b + d
-        if tx2 > tx1 and ty2 > ty1:
-            x1, y1, x2, y2 = tx1, ty1, tx2, ty2
-        else:
-            # Try cxcywh
-            tx1, ty1, tx2, ty2 = a - c / 2, b - d / 2, a + c / 2, b + d / 2
-            x1, y1, x2, y2 = tx1, ty1, tx2, ty2
+    if anchor_format != 'xyxy':
+        logger.warning_once(f'Only xyxy anchor_format is supported, got {anchor_format}. Fallback to xyxy.')
+    x1, y1, x2, y2 = a, b, c, d
 
     # If coords are in [0,1], treat as normalized.
     if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.0:
@@ -382,9 +354,10 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         anchor = None
         anchor_type = 0
         shape_wh = None
-        anchor_format = _anchor_format_from_extra(inputs.extra_kwargs)
+        anchor_format = 'xyxy'
         resize_after_crop_raw = _json_loads_maybe(inputs.extra_kwargs.get('resize_after_crop', False))
         resize_after_crop = bool(resize_after_crop_raw)
+        preclipped_video = False
         if media_type in {'image', 'video'}:
             anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
             anchor_type = _to_int(anchor_type_raw, default=0)
@@ -400,6 +373,23 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
                 inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
 
+            # In crop mode, clip raw video before parent replace_tag to preserve resolution flow.
+            if media_type == 'video' and anchor_type == 1:
+                raw_video = inputs.videos[index]
+                if isinstance(raw_video, (torch.Tensor, np.ndarray, list, tuple)):
+                    inputs.videos[index] = _apply_anchor_to_video(
+                        raw_video,
+                        anchor,
+                        anchor_type,
+                        shape_wh=shape_wh,
+                        resize_after_crop=resize_after_crop,
+                        anchor_format=anchor_format)
+                    preclipped_video = True
+                else:
+                    logger.warning_once(
+                        'Video crop is best applied before replace_tag, '
+                        f'but got unsupported raw type={type(raw_video)}. Will crop after replace_tag as fallback.')
+
         contexts = super().replace_tag(media_type, index, inputs)
         if media_type == 'image' and anchor is not None and anchor_type in {1, 2}:
             image = _load_image_flexible(inputs.images[index])
@@ -411,17 +401,19 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 resize_after_crop=resize_after_crop and (anchor_type == 1),
                 resize_target=shape_wh,
                 anchor_format=anchor_format)
-        if media_type == 'video' and anchor is not None and anchor_type in {1, 2}:
-            # Apply anchor ops on extracted in-memory frames/tensors.
-            inputs.videos[index] = _apply_anchor_to_video(
-                inputs.videos[index],
-                anchor,
-                anchor_type,
-                shape_wh=shape_wh,
-                resize_after_crop=resize_after_crop,
-                anchor_format=anchor_format)
-            # Metadata from pre-edit frames may be stale; clear for downstream re-processing.
-            _sync_video_metadata(inputs, index)
+        if media_type == 'video' and anchor is not None:
+            if anchor_type == 2 or (anchor_type == 1 and not preclipped_video):
+                # Draw mode follows parent replace_tag path.
+                # Crop mode falls back here only when pre-clip is unsupported.
+                inputs.videos[index] = _apply_anchor_to_video(
+                    inputs.videos[index],
+                    anchor,
+                    anchor_type,
+                    shape_wh=shape_wh,
+                    resize_after_crop=resize_after_crop,
+                    anchor_format=anchor_format)
+                # Metadata from pre-edit frames may be stale; clear for downstream re-processing.
+                _sync_video_metadata(inputs, index)
         return contexts
 
     def _encode(self, inputs):
