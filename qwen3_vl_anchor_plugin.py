@@ -15,11 +15,15 @@ anchor_type:
 """
 
 import json
-from typing import Any, Optional, Tuple
+import math
+import os
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from swift.template import register_template
 from swift.template.base import Template
@@ -193,6 +197,180 @@ def _load_image_flexible(image: Any) -> Image.Image:
     return Template._load_image(image, load_images=True)
 
 
+def _get_qwen_vl_constant(name: str, default: Any) -> Any:
+    try:
+        import qwen_vl_utils
+        return getattr(qwen_vl_utils, name, default)
+    except Exception:
+        return default
+
+
+def _smart_resize_qwen(height: int,
+                       width: int,
+                       *,
+                       factor: int,
+                       min_pixels: Optional[int] = None,
+                       max_pixels: Optional[int] = None) -> Tuple[int, int]:
+    from qwen_vl_utils import smart_resize
+    return smart_resize(height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
+
+
+def _to_rgb(image: Image.Image) -> Image.Image:
+    if image.mode == 'RGBA':
+        white_background = Image.new('RGB', image.size, (255, 255, 255))
+        white_background.paste(image, mask=image.split()[3])
+        return white_background
+    return image.convert('RGB')
+
+
+def _ceil_by_factor(number: int, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
+                            *,
+                            anchor: Any = None,
+                            anchor_type: int = 0,
+                            shape_wh: Optional[Tuple[int, int]] = None,
+                            image_patch_size: int = 14,
+                            anchor_format: str = 'xyxy') -> Image.Image:
+    image = ele['image'] if 'image' in ele else ele['image_url']
+    image = _to_rgb(_load_image_flexible(image))
+
+    # Crop should happen before resize so downstream resolution policy uses ROI.
+    if anchor is not None and anchor_type == 1:
+        image = _apply_anchor_to_image_obj(
+            image,
+            anchor,
+            anchor_type,
+            shape_wh=shape_wh,
+            resize_after_crop=False,
+            anchor_format=anchor_format)
+
+    patch_factor = int(image_patch_size * _get_qwen_vl_constant('SPATIAL_MERGE_SIZE', 2))
+    if 'resized_height' in ele and 'resized_width' in ele:
+        resized_height, resized_width = _smart_resize_qwen(
+            ele['resized_height'], ele['resized_width'], factor=patch_factor)
+    else:
+        width, height = image.size
+        min_pixels = ele.get('min_pixels', _get_qwen_vl_constant('IMAGE_MIN_TOKEN_NUM', 4) * patch_factor**2)
+        max_pixels = ele.get('max_pixels', _get_qwen_vl_constant('IMAGE_MAX_TOKEN_NUM', 16384) * patch_factor**2)
+        resized_height, resized_width = _smart_resize_qwen(
+            height, width, factor=patch_factor, min_pixels=min_pixels, max_pixels=max_pixels)
+    image = image.resize((resized_width, resized_height), Image.BICUBIC)
+
+    # Draw mode follows post-resize path.
+    if anchor is not None and anchor_type == 2:
+        image = _apply_anchor_to_image_obj(
+            image,
+            anchor,
+            anchor_type,
+            shape_wh=shape_wh,
+            resize_after_crop=False,
+            anchor_format=anchor_format)
+    return image
+
+
+def _load_video_frames_as_tensor(video_frames: Any) -> torch.Tensor:
+    assert isinstance(video_frames, (list, tuple)) and video_frames
+    images = [_to_rgb(_load_image_flexible(frame)) for frame in video_frames]
+    base_size = images[0].size
+    tensors = []
+    for image in images:
+        if image.size != base_size:
+            image = image.resize(base_size, Image.BICUBIC)
+        tensors.append(torch.from_numpy(np.asarray(image).transpose(2, 0, 1)))
+    return torch.stack(tensors)
+
+
+def fetch_video_with_anchor(ele: Dict[str, Any],
+                            *,
+                            anchor: Any = None,
+                            anchor_type: int = 0,
+                            shape_wh: Optional[Tuple[int, int]] = None,
+                            image_patch_size: int = 14,
+                            return_video_sample_fps: bool = False,
+                            return_video_metadata: bool = False,
+                            anchor_format: str = 'xyxy') -> Any:
+    image_factor = image_patch_size * _get_qwen_vl_constant('SPATIAL_MERGE_SIZE', 2)
+    video_min_token_num = _get_qwen_vl_constant('VIDEO_MIN_TOKEN_NUM', 128)
+    video_max_token_num = _get_qwen_vl_constant('VIDEO_MAX_TOKEN_NUM', 768)
+    frame_factor = _get_qwen_vl_constant('FRAME_FACTOR', 2)
+    model_seq_len = _get_qwen_vl_constant('MODEL_SEQ_LEN', int(float(os.environ.get('MODEL_SEQ_LEN', 128000))))
+
+    video_frame_min_pixels = video_min_token_num * image_factor * image_factor
+    video_frame_max_pixels = video_max_token_num * image_factor * image_factor
+
+    if isinstance(ele['video'], str):
+        from qwen_vl_utils import VIDEO_READER_BACKENDS, get_video_reader_backend
+        video_reader_backend = get_video_reader_backend()
+        try:
+            video, video_metadata, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
+        except Exception as e:
+            logger.warning(f'video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}')
+            video, video_metadata, sample_fps = VIDEO_READER_BACKENDS['torchvision'](ele)
+    else:
+        video = _load_video_frames_as_tensor(ele['video'])
+        nframes = _ceil_by_factor(len(video), frame_factor)
+        if len(video) < nframes:
+            pad = video[-1:].repeat(nframes - len(video), 1, 1, 1)
+            video = torch.cat([video, pad], dim=0)
+        sample_fps = ele.get('sample_fps', 2.0)
+        raw_fps = ele.get('raw_fps', sample_fps)
+        video_metadata = dict(
+            fps=raw_fps,
+            frames_indices=[i for i in range(len(video))],
+            total_num_frames=(nframes / sample_fps) * raw_fps,
+            video_backend='frame_list')
+
+    # Crop mode should happen before resize.
+    if anchor is not None and anchor_type == 1:
+        video = _apply_anchor_to_torch_video(
+            video,
+            anchor,
+            anchor_type,
+            shape_wh=shape_wh,
+            resize_after_crop=False,
+            anchor_format=anchor_format)
+
+    nframes, _, height, width = video.shape
+    min_pixels = ele.get('min_pixels', video_frame_min_pixels)
+    total_pixels = ele.get('total_pixels', model_seq_len * image_factor * image_factor * 0.9)
+    max_pixels = max(min(video_frame_max_pixels, total_pixels / max(nframes, 1) * frame_factor), int(min_pixels * 1.05))
+    max_pixels_supposed = ele.get('max_pixels', max_pixels)
+    if max_pixels_supposed > max_pixels:
+        logger.warning(f'The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}].')
+    max_pixels = min(max_pixels_supposed, max_pixels)
+
+    if 'resized_height' in ele and 'resized_width' in ele:
+        resized_height, resized_width = _smart_resize_qwen(
+            ele['resized_height'], ele['resized_width'], factor=image_factor)
+    else:
+        resized_height, resized_width = _smart_resize_qwen(
+            height, width, factor=image_factor, min_pixels=min_pixels, max_pixels=max_pixels)
+
+    video = transforms.functional.resize(
+        video,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True).float()
+
+    # Draw mode follows post-resize path.
+    if anchor is not None and anchor_type == 2:
+        video = _apply_anchor_to_torch_video(
+            video,
+            anchor,
+            anchor_type,
+            shape_wh=shape_wh,
+            resize_after_crop=False,
+            anchor_format=anchor_format)
+
+    final_video = (video, video_metadata) if return_video_metadata else video
+    if return_video_sample_fps:
+        return final_video, sample_fps
+    return final_video
+
+
 def _is_channel_last_video(arr: Any) -> bool:
     return arr.ndim == 4 and arr.shape[-1] in (1, 3, 4)
 
@@ -322,20 +500,6 @@ def _apply_anchor_to_video(video: Any,
     return video
 
 
-def _sync_video_metadata(inputs, index: int) -> None:
-    """Remove stale video metadata after in-memory frame edits.
-
-    Qwen3-VL (v3) stores `video_metadata` during `replace_tag(fetch_video)`.
-    Once we crop/resize frames in memory, old metadata can become inconsistent.
-    We clear it and let the later processor call in `_encode` consume updated frames.
-    """
-    mm_kwargs = inputs.mm_processor_kwargs
-    video_metadata = mm_kwargs.get('video_metadata', None)
-    if video_metadata is not None:
-        # Avoid mixing stale/new entries across multi-video samples after frame edits.
-        mm_kwargs.pop('video_metadata', None)
-
-
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     @staticmethod
@@ -351,70 +515,81 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         return _parse_shape_wh(shape_raw)
 
     def replace_tag(self, media_type, index, inputs):
+        if media_type not in {'image', 'video'}:
+            return super().replace_tag(media_type, index, inputs)
+
         anchor = None
         anchor_type = 0
         shape_wh = None
         anchor_format = 'xyxy'
-        resize_after_crop_raw = _json_loads_maybe(inputs.extra_kwargs.get('resize_after_crop', False))
-        resize_after_crop = bool(resize_after_crop_raw)
-        preclipped_video = False
-        if media_type in {'image', 'video'}:
-            anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
-            anchor_type = _to_int(anchor_type_raw, default=0)
-            if anchor_type not in {0, 1, 2}:
-                logger.warning_once(f'Invalid anchor_type={anchor_type}, fallback to 0')
-                anchor_type = 0
+        anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
+        anchor_type = _to_int(anchor_type_raw, default=0)
+        if anchor_type not in {0, 1, 2}:
+            logger.warning_once(f'Invalid anchor_type={anchor_type}, fallback to 0')
+            anchor_type = 0
 
-            anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
-            shape_wh = self._get_shape_wh(inputs, media_type, index)
+        anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
+        shape_wh = self._get_shape_wh(inputs, media_type, index)
+        if anchor is not None:
+            inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
+            inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
 
-            # Optional pass-through for custom downstream processors.
-            if anchor is not None:
-                inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
-                inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
+        kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
+        if self.mode == 'vllm':
+            # resized in qwen_vl_utils, no need to resize again in vllm
+            inputs.mm_processor_kwargs['do_resize'] = False
 
-            # In crop mode, clip raw video before parent replace_tag to preserve resolution flow.
-            if media_type == 'video' and anchor_type == 1:
-                raw_video = inputs.videos[index]
-                if isinstance(raw_video, (torch.Tensor, np.ndarray, list, tuple)):
-                    inputs.videos[index] = _apply_anchor_to_video(
-                        raw_video,
-                        anchor,
-                        anchor_type,
-                        shape_wh=shape_wh,
-                        resize_after_crop=resize_after_crop,
-                        anchor_format=anchor_format)
-                    preclipped_video = True
-                else:
-                    logger.warning_once(
-                        'Video crop is best applied before replace_tag, '
-                        f'but got unsupported raw type={type(raw_video)}. Will crop after replace_tag as fallback.')
-
-        contexts = super().replace_tag(media_type, index, inputs)
-        if media_type == 'image' and anchor is not None and anchor_type in {1, 2}:
-            image = _load_image_flexible(inputs.images[index])
-            inputs.images[index] = _apply_anchor_to_image_obj(
-                image,
-                anchor,
-                anchor_type,
-                shape_wh=shape_wh,
-                resize_after_crop=resize_after_crop and (anchor_type == 1),
-                resize_target=shape_wh,
-                anchor_format=anchor_format)
-        if media_type == 'video' and anchor is not None:
-            if anchor_type == 2 or (anchor_type == 1 and not preclipped_video):
-                # Draw mode follows parent replace_tag path.
-                # Crop mode falls back here only when pre-clip is unsupported.
-                inputs.videos[index] = _apply_anchor_to_video(
-                    inputs.videos[index],
-                    anchor,
-                    anchor_type,
+        if media_type == 'image':
+            image_ele = {'image': inputs.images[index]}
+            if anchor is not None and anchor_type in {1, 2}:
+                inputs.images[index] = fetch_image_with_anchor(
+                    image_ele,
+                    anchor=anchor,
+                    anchor_type=anchor_type,
                     shape_wh=shape_wh,
-                    resize_after_crop=resize_after_crop,
-                    anchor_format=anchor_format)
-                # Metadata from pre-edit frames may be stale; clear for downstream re-processing.
-                _sync_video_metadata(inputs, index)
-        return contexts
+                    anchor_format=anchor_format,
+                    **kwargs)
+            else:
+                from qwen_vl_utils import fetch_image
+                inputs.images[index] = fetch_image(image_ele, **kwargs)
+            if self.mode == 'lmdeploy':
+                return ['<|vision_start|>', [-100], '<|vision_end|>']
+            return ['<|vision_start|><|image_pad|><|vision_end|>']
+
+        if self.version == 'v3':
+            kwargs['return_video_metadata'] = True
+        video = inputs.videos[index]
+        video_inputs = {'video': video}
+        if isinstance(video, list):  # image list
+            sample_fps = _get_qwen_vl_constant('FPS', 2.0)
+            video_inputs['sample_fps'] = sample_fps
+
+        if anchor is not None and anchor_type in {1, 2}:
+            video, video_kwargs = fetch_video_with_anchor(
+                video_inputs,
+                return_video_sample_fps=True,
+                anchor=anchor,
+                anchor_type=anchor_type,
+                shape_wh=shape_wh,
+                anchor_format=anchor_format,
+                **kwargs)
+        else:
+            from qwen_vl_utils import fetch_video
+            video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
+
+        tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
+        if self.version == 'v2_5':
+            inputs.mm_processor_kwargs.setdefault('fps', []).append(video_kwargs)
+        elif self.version == 'v3':
+            if self.mode != 'vllm':
+                video, video_metadata = video
+                inputs.mm_processor_kwargs.setdefault('video_metadata', []).append(video_metadata)
+                tokens = ['<|video_pad|>']
+            inputs.mm_processor_kwargs['do_sample_frames'] = False
+        if isinstance(video, torch.Tensor):
+            video = video.to(torch.uint8)
+        inputs.videos[index] = video
+        return tokens
 
     def _encode(self, inputs):
         # Fallback if processor does not accept custom anchor kwargs.
