@@ -391,6 +391,8 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
                                  anchor_format: str = 'auto') -> np.ndarray:
     if video.ndim != 4:
         return video
+    if anchor_type not in (1, 2):
+        return video
     channel_last = _is_channel_last_video(video)
     if not channel_last and not _is_channel_first_video(video):
         return video
@@ -407,8 +409,24 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     x1, y1, x2, y2 = box
 
-    if anchor_type not in (1, 2):
-        return video
+    if anchor_type == 1:
+        if channel_last:
+            cropped = video[:, y1:y2, x1:x2, ...]
+        else:
+            cropped = video[:, :, y1:y2, x1:x2]
+        # Keep compatibility for callers that expect original resolution after crop.
+        if not resize_after_crop:
+            return np.ascontiguousarray(cropped)
+        out = []
+        for frame in cropped:
+            frame_hwc = frame if channel_last else np.transpose(frame, (1, 2, 0))
+            img = Image.fromarray(np.asarray(frame_hwc, dtype=np.uint8))
+            img = img.resize((curr_w, curr_h), Image.BICUBIC)
+            frame_out = np.asarray(img)
+            if not channel_last:
+                frame_out = np.transpose(frame_out, (2, 0, 1))
+            out.append(frame_out)
+        return np.ascontiguousarray(np.stack(out, axis=0))
 
     out = []
     for frame in video:
@@ -417,14 +435,10 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         else:
             frame_hwc = np.transpose(frame, (1, 2, 0))
         frame_hwc = np.asarray(frame_hwc, dtype=np.uint8)
-        img = Image.fromarray(frame_hwc)
-        img = _apply_anchor_to_image_obj(
-            img,
-            anchor,
-            anchor_type,
-            shape_wh=(curr_w, curr_h),
-            resize_after_crop=resize_after_crop and (anchor_type == 1),
-            resize_target=(curr_w, curr_h))
+        img = Image.fromarray(frame_hwc).copy()
+        draw = ImageDraw.Draw(img)
+        line_width = max(2, min(curr_w, curr_h) // 200)
+        draw.rectangle((x1, y1, x2, y2), outline='red', width=line_width)
         frame_out = np.asarray(img)
         if not channel_last:
             frame_out = np.transpose(frame_out, (2, 0, 1))
