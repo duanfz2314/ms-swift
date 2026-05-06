@@ -17,6 +17,7 @@ anchor_type:
 import json
 import math
 import os
+from functools import lru_cache
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -32,6 +33,22 @@ from swift.utils import get_logger
 
 logger = get_logger()
 TEMPLATE_TYPE = 'qwen3_vl_anchor'
+ANCHOR_TYPE_NONE = 0
+ANCHOR_TYPE_CROP = 1
+ANCHOR_TYPE_DRAW = 2
+VALID_ANCHOR_TYPES = {ANCHOR_TYPE_NONE, ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}
+
+
+def _has_anchor_operation(anchor: Any, anchor_type: int) -> bool:
+    return anchor is not None and anchor_type in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}
+
+
+def _normalize_anchor_type(value: Any) -> int:
+    anchor_type = _to_int(value, default=ANCHOR_TYPE_NONE)
+    if anchor_type not in VALID_ANCHOR_TYPES:
+        logger.warning_once(f'Invalid anchor_type={anchor_type}, fallback to {ANCHOR_TYPE_NONE}')
+        return ANCHOR_TYPE_NONE
+    return anchor_type
 
 
 def _json_loads_maybe(value: Any) -> Any:
@@ -179,13 +196,13 @@ def _apply_anchor_to_image_obj(image: Image.Image,
         return image
     if (anchor_ref_w, anchor_ref_h) != (curr_w, curr_h):
         box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
-    if anchor_type == 1:
+    if anchor_type == ANCHOR_TYPE_CROP:
         image = image.crop(box)
         if resize_after_crop:
             target_w, target_h = resize_target or (curr_w, curr_h)
             image = image.resize((target_w, target_h), Image.BICUBIC)
         return image
-    if anchor_type == 2:
+    if anchor_type == ANCHOR_TYPE_DRAW:
         image = image.copy()
         draw = ImageDraw.Draw(image)
         line_width = max(2, min(image.width, image.height) // 200)
@@ -197,6 +214,7 @@ def _load_image_flexible(image: Any) -> Image.Image:
     return Template._load_image(image, load_images=True)
 
 
+@lru_cache(maxsize=1)
 def _get_qwen_vl_vision_process():
     from qwen_vl_utils import vision_process
     return vision_process
@@ -229,6 +247,18 @@ def _ceil_by_factor(number: int, factor: int) -> int:
     return math.ceil(number / factor) * factor
 
 
+def _frame_to_hwc(frame: np.ndarray, channel_last: bool) -> np.ndarray:
+    if channel_last:
+        return frame
+    return np.transpose(frame, (1, 2, 0))
+
+
+def _frame_from_hwc(frame_hwc: np.ndarray, channel_last: bool) -> np.ndarray:
+    if channel_last:
+        return frame_hwc
+    return np.transpose(frame_hwc, (2, 0, 1))
+
+
 def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
                             *,
                             anchor: Any = None,
@@ -240,7 +270,7 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
     image = _to_rgb(_load_image_flexible(image))
 
     # Crop should happen before resize so downstream resolution policy uses ROI.
-    if anchor is not None and anchor_type == 1:
+    if anchor is not None and anchor_type == ANCHOR_TYPE_CROP:
         image = _apply_anchor_to_image_obj(
             image,
             anchor,
@@ -262,7 +292,7 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
     image = image.resize((resized_width, resized_height), Image.BICUBIC)
 
     # Draw mode follows post-resize path.
-    if anchor is not None and anchor_type == 2:
+    if anchor is not None and anchor_type == ANCHOR_TYPE_DRAW:
         image = _apply_anchor_to_image_obj(
             image,
             anchor,
@@ -327,7 +357,7 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
             video_backend='frame_list')
 
     # Crop mode should happen before resize.
-    if anchor is not None and anchor_type == 1:
+    if anchor is not None and anchor_type == ANCHOR_TYPE_CROP:
         video = _apply_anchor_to_torch_video(
             video,
             anchor,
@@ -359,7 +389,7 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
         antialias=True).float()
 
     # Draw mode follows post-resize path.
-    if anchor is not None and anchor_type == 2:
+    if anchor is not None and anchor_type == ANCHOR_TYPE_DRAW:
         video = _apply_anchor_to_torch_video(
             video,
             anchor,
@@ -391,7 +421,7 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
                                  anchor_format: str = 'auto') -> np.ndarray:
     if video.ndim != 4:
         return video
-    if anchor_type not in (1, 2):
+    if anchor_type not in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}:
         return video
     channel_last = _is_channel_last_video(video)
     if not channel_last and not _is_channel_first_video(video):
@@ -409,7 +439,7 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     x1, y1, x2, y2 = box
 
-    if anchor_type == 1:
+    if anchor_type == ANCHOR_TYPE_CROP:
         if channel_last:
             cropped = video[:, y1:y2, x1:x2, ...]
         else:
@@ -419,30 +449,22 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
             return np.ascontiguousarray(cropped)
         out = []
         for frame in cropped:
-            frame_hwc = frame if channel_last else np.transpose(frame, (1, 2, 0))
+            frame_hwc = _frame_to_hwc(frame, channel_last)
             img = Image.fromarray(np.asarray(frame_hwc, dtype=np.uint8))
             img = img.resize((curr_w, curr_h), Image.BICUBIC)
             frame_out = np.asarray(img)
-            if not channel_last:
-                frame_out = np.transpose(frame_out, (2, 0, 1))
-            out.append(frame_out)
+            out.append(_frame_from_hwc(frame_out, channel_last))
         return np.ascontiguousarray(np.stack(out, axis=0))
 
     out = []
     for frame in video:
-        if channel_last:
-            frame_hwc = frame
-        else:
-            frame_hwc = np.transpose(frame, (1, 2, 0))
+        frame_hwc = _frame_to_hwc(frame, channel_last)
         frame_hwc = np.asarray(frame_hwc, dtype=np.uint8)
         img = Image.fromarray(frame_hwc).copy()
         draw = ImageDraw.Draw(img)
         line_width = max(2, min(curr_w, curr_h) // 200)
         draw.rectangle((x1, y1, x2, y2), outline='red', width=line_width)
-        frame_out = np.asarray(img)
-        if not channel_last:
-            frame_out = np.transpose(frame_out, (2, 0, 1))
-        out.append(frame_out)
+        out.append(_frame_from_hwc(np.asarray(img), channel_last))
     return np.ascontiguousarray(np.stack(out, axis=0))
 
 
@@ -455,7 +477,7 @@ def _apply_anchor_to_torch_video(video: torch.Tensor,
                                  anchor_format: str = 'auto') -> torch.Tensor:
     if video.ndim != 4:
         return video
-    if anchor_type not in (1, 2):
+    if anchor_type not in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}:
         return video
     video_np = video.detach().cpu().numpy()
     out_np = _apply_anchor_to_numpy_video(
@@ -478,7 +500,7 @@ def _apply_anchor_to_video(video: Any,
                            shape_wh: Optional[Tuple[int, int]] = None,
                            resize_after_crop: bool = False,
                            anchor_format: str = 'auto') -> Any:
-    if anchor_type == 0:
+    if anchor_type == ANCHOR_TYPE_NONE:
         return video
     if isinstance(video, torch.Tensor):
         return _apply_anchor_to_torch_video(
@@ -507,7 +529,7 @@ def _apply_anchor_to_video(video: Any,
                     anchor,
                     anchor_type,
                     shape_wh=shape_wh,
-                    resize_after_crop=resize_after_crop and (anchor_type == 1),
+                    resize_after_crop=resize_after_crop and (anchor_type == ANCHOR_TYPE_CROP),
                     resize_target=shape_wh or (img.width, img.height),
                     anchor_format=anchor_format)
                 processed.append(np.asarray(img))
@@ -531,57 +553,57 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
         return _parse_shape_wh(shape_raw)
 
-    def replace_tag(self, media_type, index, inputs):
-        if media_type not in {'image', 'video'}:
-            return super().replace_tag(media_type, index, inputs)
-
-        anchor = None
-        anchor_type = 0
-        shape_wh = None
-        anchor_format = 'xyxy'
-        anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', 0), media_type, index)
-        anchor_type = _to_int(anchor_type_raw, default=0)
-        if anchor_type not in {0, 1, 2}:
-            logger.warning_once(f'Invalid anchor_type={anchor_type}, fallback to 0')
-            anchor_type = 0
-
+    @staticmethod
+    def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, Optional[Tuple[int, int]], str]:
+        anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), media_type, index)
+        anchor_type = _normalize_anchor_type(anchor_type_raw)
         anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
-        shape_wh = self._get_shape_wh(inputs, media_type, index)
-        if anchor is not None:
-            inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
-            inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
+        shape_wh = Qwen3VLAnchorTemplate._get_shape_wh(inputs, media_type, index)
+        return anchor, anchor_type, shape_wh, 'xyxy'
 
+    @staticmethod
+    def _append_anchor_kwargs(media_type: str, inputs, anchor: Any, anchor_type: int) -> None:
+        if anchor is None:
+            return
+        inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
+        inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
+
+    def _build_fetch_kwargs(self, inputs) -> Dict[str, Any]:
         kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
         if self.mode == 'vllm':
             # resized in qwen_vl_utils, no need to resize again in vllm
             inputs.mm_processor_kwargs['do_resize'] = False
+        return kwargs
 
-        if media_type == 'image':
-            image_ele = {'image': inputs.images[index]}
-            if anchor is not None and anchor_type in {1, 2}:
-                inputs.images[index] = fetch_image_with_anchor(
-                    image_ele,
-                    anchor=anchor,
-                    anchor_type=anchor_type,
-                    shape_wh=shape_wh,
-                    anchor_format=anchor_format,
-                    **kwargs)
-            else:
-                from qwen_vl_utils import fetch_image
-                inputs.images[index] = fetch_image(image_ele, **kwargs)
-            if self.mode == 'lmdeploy':
-                return ['<|vision_start|>', [-100], '<|vision_end|>']
-            return ['<|vision_start|><|image_pad|><|vision_end|>']
+    def _replace_image_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
+                           fetch_kwargs: Dict[str, Any]):
+        image_ele = {'image': inputs.images[index]}
+        if _has_anchor_operation(anchor, anchor_type):
+            inputs.images[index] = fetch_image_with_anchor(
+                image_ele,
+                anchor=anchor,
+                anchor_type=anchor_type,
+                shape_wh=shape_wh,
+                anchor_format=anchor_format,
+                **fetch_kwargs)
+        else:
+            from qwen_vl_utils import fetch_image
+            inputs.images[index] = fetch_image(image_ele, **fetch_kwargs)
+        if self.mode == 'lmdeploy':
+            return ['<|vision_start|>', [-100], '<|vision_end|>']
+        return ['<|vision_start|><|image_pad|><|vision_end|>']
 
+    def _replace_video_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
+                           fetch_kwargs: Dict[str, Any]):
+        video_fetch_kwargs = dict(fetch_kwargs)
         if self.version == 'v3':
-            kwargs['return_video_metadata'] = True
+            video_fetch_kwargs['return_video_metadata'] = True
         video = inputs.videos[index]
         video_inputs = {'video': video}
         if isinstance(video, list):  # image list
-            sample_fps = _get_qwen_vl_constant('FPS', 2.0)
-            video_inputs['sample_fps'] = sample_fps
+            video_inputs['sample_fps'] = _get_qwen_vl_constant('FPS', 2.0)
 
-        if anchor is not None and anchor_type in {1, 2}:
+        if _has_anchor_operation(anchor, anchor_type):
             video, video_kwargs = fetch_video_with_anchor(
                 video_inputs,
                 return_video_sample_fps=True,
@@ -589,10 +611,10 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 anchor_type=anchor_type,
                 shape_wh=shape_wh,
                 anchor_format=anchor_format,
-                **kwargs)
+                **video_fetch_kwargs)
         else:
             from qwen_vl_utils import fetch_video
-            video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
+            video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **video_fetch_kwargs)
 
         tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
         if self.version == 'v2_5':
@@ -607,6 +629,16 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             video = video.to(torch.uint8)
         inputs.videos[index] = video
         return tokens
+
+    def replace_tag(self, media_type, index, inputs):
+        if media_type not in {'image', 'video'}:
+            return super().replace_tag(media_type, index, inputs)
+        anchor, anchor_type, shape_wh, anchor_format = self._collect_anchor_info(media_type, index, inputs)
+        self._append_anchor_kwargs(media_type, inputs, anchor, anchor_type)
+        fetch_kwargs = self._build_fetch_kwargs(inputs)
+        if media_type == 'image':
+            return self._replace_image_tag(index, inputs, anchor, anchor_type, shape_wh, anchor_format, fetch_kwargs)
+        return self._replace_video_tag(index, inputs, anchor, anchor_type, shape_wh, anchor_format, fetch_kwargs)
 
     def _encode(self, inputs):
         # Fallback if processor does not accept custom anchor kwargs.
