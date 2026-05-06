@@ -597,21 +597,29 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     @staticmethod
     def _get_shape_wh(inputs, media_type: str, index: int) -> Optional[Tuple[int, int]]:
-        # Explicit keys requested by user.
         if media_type == 'image':
-            shape_raw = _pick_media_value(inputs.extra_kwargs.get('image_shape'), media_type, index)
+            shape_raw = inputs.extra_kwargs.get('image_shape')
         else:
-            shape_raw = _pick_media_value(inputs.extra_kwargs.get('video_shape'), media_type, index)
+            shape_raw = inputs.extra_kwargs.get('video_shape')
         if shape_raw is None:
-            # backward compatibility fallback
-            shape_raw = _pick_media_value(inputs.extra_kwargs.get('shape'), media_type, index)
+            shape_raw = inputs.extra_kwargs.get('shape')
+        if isinstance(shape_raw, (list, tuple)) and shape_raw and isinstance(shape_raw[0], (list, tuple)):
+            shape_raw = shape_raw[index] if index < len(shape_raw) else shape_raw[-1]
         return _parse_shape_wh(shape_raw)
 
     @staticmethod
     def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, Optional[Tuple[int, int]], str]:
-        anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), media_type, index)
+        anchor_type_raw = inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE)
+        if isinstance(anchor_type_raw, (list, tuple)):
+            if anchor_type_raw:
+                anchor_type_raw = anchor_type_raw[index] if index < len(anchor_type_raw) else anchor_type_raw[-1]
+            else:
+                anchor_type_raw = ANCHOR_TYPE_NONE
         anchor_type = _normalize_anchor_type(anchor_type_raw)
-        anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
+
+        anchor = inputs.extra_kwargs.get('anchors')
+        if isinstance(anchor, (list, tuple)) and anchor and isinstance(anchor[0], (list, tuple)):
+            anchor = anchor[index] if index < len(anchor) else anchor[-1]
         # [0,0,0,0] means "no crop", but draw mode should still draw it.
         if anchor_type == ANCHOR_TYPE_CROP and _is_noop_anchor(anchor):
             anchor = None
