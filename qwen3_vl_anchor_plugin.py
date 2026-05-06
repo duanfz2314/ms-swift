@@ -188,6 +188,14 @@ def _normalize_anchor(anchor: Any,
 
     if anchor_format != 'xyxy':
         logger.warning_once(f'Only xyxy anchor_format is supported, got {anchor_format}. Fallback to xyxy.')
+    if max(abs(a), abs(b), abs(c), abs(d)) > 1.0:
+        # Heuristic: anchors are xyxy; if they do not fit (w,h) but fit (h,w), swap ref dims.
+        max_x = max(a, c)
+        max_y = max(b, d)
+        if (max_x > width or max_y > height) and (max_x <= height and max_y <= width):
+            width, height = height, width
+            logger.warning_once(
+                'Anchor appears to use swapped reference shape (h,w). Auto-correcting to (w,h) for drawing/crop.')
     x1, y1, x2, y2 = a, b, c, d
 
     # If coords are in [0,1], treat as normalized.
@@ -223,6 +231,28 @@ def _rescale_box(box: Tuple[int, int, int, int], src_w: int, src_h: int, dst_w: 
     return nx1, ny1, nx2, ny2
 
 
+def _to_draw_box(box: Tuple[int, int, int, int], width: int, height: int, line_width: int) -> Tuple[int, int, int, int]:
+    """Convert crop-style box [x1,y1,x2,y2) to visible draw box inside image."""
+    x1, y1, x2, y2 = box
+    # PIL draw.rectangle uses inclusive max corner. Convert first.
+    left = max(0, min(x1, width - 1))
+    top = max(0, min(y1, height - 1))
+    right = max(left, min(x2 - 1, width - 1))
+    bottom = max(top, min(y2 - 1, height - 1))
+
+    # Keep border-visible: if touching boundary, move inward by half line width.
+    inset = max(1, line_width // 2)
+    if left == 0:
+        left = min(inset, width - 1)
+    if top == 0:
+        top = min(inset, height - 1)
+    if right == width - 1:
+        right = max(left, width - 1 - inset)
+    if bottom == height - 1:
+        bottom = max(top, height - 1 - inset)
+    return left, top, right, bottom
+
+
 def _apply_anchor_to_image_obj(image: Image.Image,
                                anchor: Any,
                                anchor_type: int,
@@ -248,7 +278,7 @@ def _apply_anchor_to_image_obj(image: Image.Image,
         image = image.copy()
         draw = ImageDraw.Draw(image)
         line_width = max(2, min(image.width, image.height) // 200)
-        draw.rectangle(box, outline='red', width=line_width)
+        draw.rectangle(_to_draw_box(box, image.width, image.height, line_width), outline='red', width=line_width)
     return image
 
 
@@ -546,7 +576,8 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         img = Image.fromarray(frame_hwc).copy()
         draw = ImageDraw.Draw(img)
         line_width = max(2, min(curr_w, curr_h) // 200)
-        draw.rectangle((x1, y1, x2, y2), outline='red', width=line_width)
+        draw_box = _to_draw_box((x1, y1, x2, y2), curr_w, curr_h, line_width)
+        draw.rectangle(draw_box, outline='red', width=line_width)
         out.append(_frame_from_hwc(np.asarray(img), channel_last))
     return np.ascontiguousarray(np.stack(out, axis=0))
 
