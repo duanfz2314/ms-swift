@@ -197,32 +197,14 @@ def _load_image_flexible(image: Any) -> Image.Image:
     return Template._load_image(image, load_images=True)
 
 
-def _get_qwen_vl_module():
-    try:
-        import qwen_vl_utils
-        return qwen_vl_utils
-    except Exception:
-        return None
-
-
 def _get_qwen_vl_vision_process():
-    module = _get_qwen_vl_module()
-    if module is None:
-        return None
-    return getattr(module, 'vision_process', None)
+    from qwen_vl_utils import vision_process
+    return vision_process
 
 
 def _get_qwen_vl_constant(name: str, default: Any) -> Any:
     vision_process = _get_qwen_vl_vision_process()
-    if vision_process is not None and hasattr(vision_process, name):
-        return getattr(vision_process, name)
-    try:
-        module = _get_qwen_vl_module()
-        if module is not None and hasattr(module, name):
-            return getattr(module, name)
-        return default
-    except Exception:
-        return default
+    return getattr(vision_process, name, default)
 
 
 def _smart_resize_qwen(height: int,
@@ -232,34 +214,7 @@ def _smart_resize_qwen(height: int,
                        min_pixels: Optional[int] = None,
                        max_pixels: Optional[int] = None) -> Tuple[int, int]:
     vision_process = _get_qwen_vl_vision_process()
-    smart_resize = getattr(vision_process, 'smart_resize', None) if vision_process is not None else None
-    if smart_resize is None:
-        module = _get_qwen_vl_module()
-        smart_resize = getattr(module, 'smart_resize', None) if module is not None else None
-    if smart_resize is not None:
-        return smart_resize(height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
-
-    # Fallback to qwen smart_resize behavior when import path differs.
-    max_ratio = int(_get_qwen_vl_constant('MAX_RATIO', 200))
-    image_max_token_num = int(_get_qwen_vl_constant('IMAGE_MAX_TOKEN_NUM', 16384))
-    image_min_token_num = int(_get_qwen_vl_constant('IMAGE_MIN_TOKEN_NUM', 4))
-    max_pixels = max_pixels if max_pixels is not None else (image_max_token_num * factor**2)
-    min_pixels = min_pixels if min_pixels is not None else (image_min_token_num * factor**2)
-    if max(height, width) / min(height, width) > max_ratio:
-        raise ValueError(f'absolute aspect ratio must be smaller than {max_ratio}')
-    h_bar = max(factor, int(round(height / factor) * factor))
-    w_bar = max(factor, int(round(width / factor) * factor))
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = int(math.floor(height / beta / factor) * factor)
-        w_bar = int(math.floor(width / beta / factor) * factor)
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = int(math.ceil(height * beta / factor) * factor)
-        w_bar = int(math.ceil(width * beta / factor) * factor)
-    h_bar = max(factor, h_bar)
-    w_bar = max(factor, w_bar)
-    return h_bar, w_bar
+    return vision_process.smart_resize(height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
 
 
 def _to_rgb(image: Image.Image) -> Image.Image:
@@ -350,41 +305,13 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
 
     if isinstance(ele['video'], str):
         vision_process = _get_qwen_vl_vision_process()
-        backends = getattr(vision_process, 'VIDEO_READER_BACKENDS', None) if vision_process is not None else None
-        get_backend = getattr(vision_process, 'get_video_reader_backend', None) if vision_process is not None else None
-        if isinstance(backends, dict) and callable(get_backend):
-            video_reader_backend = get_backend()
-            try:
-                video, video_metadata, sample_fps = backends[video_reader_backend](ele)
-            except Exception as e:
-                logger.warning(f'video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}')
-                video, video_metadata, sample_fps = backends['torchvision'](ele)
-        else:
-            from qwen_vl_utils import fetch_video as qwen_fetch_video
-            logger.warning_once(
-                'qwen_vl_utils backend symbols are unavailable from vision_process; '
-                'fallback to fetch_video and apply anchors on fetched frames.')
-            fetched_video, sample_fps = qwen_fetch_video(
-                ele,
-                image_patch_size=image_patch_size,
-                return_video_sample_fps=True,
-                return_video_metadata=True)
-            if isinstance(fetched_video, tuple) and len(fetched_video) == 2:
-                video, video_metadata = fetched_video
-            else:
-                video, video_metadata = fetched_video, {}
-            if anchor is not None and anchor_type in {1, 2}:
-                video = _apply_anchor_to_video(
-                    video,
-                    anchor,
-                    anchor_type,
-                    shape_wh=shape_wh,
-                    resize_after_crop=False,
-                    anchor_format=anchor_format)
-            final_video = (video, video_metadata) if return_video_metadata else video
-            if return_video_sample_fps:
-                return final_video, sample_fps
-            return final_video
+        backends = vision_process.VIDEO_READER_BACKENDS
+        video_reader_backend = vision_process.get_video_reader_backend()
+        try:
+            video, video_metadata, sample_fps = backends[video_reader_backend](ele)
+        except Exception as e:
+            logger.warning(f'video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}')
+            video, video_metadata, sample_fps = backends['torchvision'](ele)
     else:
         video = _load_video_frames_as_tensor(ele['video'])
         nframes = _ceil_by_factor(len(video), frame_factor)
