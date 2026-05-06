@@ -339,8 +339,9 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
     image = ele['image'] if 'image' in ele else ele['image_url']
     image = _to_rgb(_load_image_flexible(image))
 
-    # Crop should happen before resize so downstream resolution policy uses ROI.
-    if anchor is not None and anchor_type == ANCHOR_TYPE_CROP:
+    # Anchor ops are based on absolute coordinates from original media.
+    # Apply before resize to avoid coordinate drift.
+    if anchor is not None and anchor_type in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}:
         image = _apply_anchor_to_image_obj(
             image,
             anchor,
@@ -361,15 +362,6 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
             height, width, factor=patch_factor, min_pixels=min_pixels, max_pixels=max_pixels)
     image = image.resize((resized_width, resized_height), Image.BICUBIC)
 
-    # Draw mode follows post-resize path.
-    if anchor is not None and anchor_type == ANCHOR_TYPE_DRAW:
-        image = _apply_anchor_to_image_obj(
-            image,
-            anchor,
-            anchor_type,
-            shape_wh=shape_wh,
-            resize_after_crop=False,
-            anchor_format=anchor_format)
     return image
 
 
@@ -426,8 +418,9 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
             total_num_frames=(nframes / sample_fps) * raw_fps,
             video_backend='frame_list')
 
-    # Crop mode should happen before resize.
-    if anchor is not None and anchor_type == ANCHOR_TYPE_CROP:
+    # Anchor ops are based on absolute coordinates from original media.
+    # Apply before resize to avoid coordinate drift.
+    if anchor is not None and anchor_type in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}:
         video = _apply_anchor_to_torch_video(
             video,
             anchor,
@@ -457,16 +450,6 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
         [resized_height, resized_width],
         interpolation=InterpolationMode.BICUBIC,
         antialias=True).float()
-
-    # Draw mode follows post-resize path.
-    if anchor is not None and anchor_type == ANCHOR_TYPE_DRAW:
-        video = _apply_anchor_to_torch_video(
-            video,
-            anchor,
-            anchor_type,
-            shape_wh=shape_wh,
-            resize_after_crop=False,
-            anchor_format=anchor_format)
 
     final_video = (video, video_metadata) if return_video_metadata else video
     if return_video_sample_fps:
