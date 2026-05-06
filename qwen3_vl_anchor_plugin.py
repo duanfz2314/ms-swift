@@ -17,6 +17,7 @@ anchor_type:
 import json
 import math
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -49,6 +50,47 @@ def _normalize_anchor_type(value: Any) -> int:
         logger.warning_once(f'Invalid anchor_type={anchor_type}, fallback to {ANCHOR_TYPE_NONE}')
         return ANCHOR_TYPE_NONE
     return anchor_type
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    value = _json_loads_maybe(value)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if text in {'0', 'false', 'no', 'n', 'off', ''}:
+            return False
+    return bool(value)
+
+
+def _is_noop_anchor(anchor: Any) -> bool:
+    anchor = _json_loads_maybe(anchor)
+    if isinstance(anchor, dict):
+        if 'bbox' in anchor:
+            anchor = anchor['bbox']
+        else:
+            anchor = [anchor.get('x1'), anchor.get('y1'), anchor.get('x2'), anchor.get('y2')]
+    if not isinstance(anchor, (list, tuple)) or len(anchor) < 4:
+        return False
+    try:
+        a, b, c, d = (float(anchor[0]), float(anchor[1]), float(anchor[2]), float(anchor[3]))
+    except Exception:
+        return False
+    return abs(a) < 1e-8 and abs(b) < 1e-8 and abs(c) < 1e-8 and abs(d) < 1e-8
+
+
+def _anchor_type_name(anchor_type: int) -> str:
+    if anchor_type == ANCHOR_TYPE_CROP:
+        return 'crop'
+    if anchor_type == ANCHOR_TYPE_DRAW:
+        return 'draw'
+    return 'none'
 
 
 def _json_loads_maybe(value: Any) -> Any:
@@ -257,6 +299,47 @@ def _frame_from_hwc(frame_hwc: np.ndarray, channel_last: bool) -> np.ndarray:
     if channel_last:
         return frame_hwc
     return np.transpose(frame_hwc, (2, 0, 1))
+
+
+def _frame_to_pil_image(frame: Any) -> Optional[Image.Image]:
+    if isinstance(frame, Image.Image):
+        return _to_rgb(frame.copy())
+
+    if isinstance(frame, torch.Tensor):
+        arr = frame.detach().cpu().numpy()
+    elif isinstance(frame, np.ndarray):
+        arr = frame
+    else:
+        try:
+            return _to_rgb(_load_image_flexible(frame))
+        except Exception:
+            return None
+
+    if arr.ndim != 3:
+        return None
+    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    try:
+        return _to_rgb(Image.fromarray(arr))
+    except Exception:
+        return None
+
+
+def _video_last_frame_to_pil(video: Any) -> Optional[Image.Image]:
+    if isinstance(video, torch.Tensor) and video.ndim == 4 and video.shape[0] > 0:
+        return _frame_to_pil_image(video[-1])
+    if isinstance(video, np.ndarray) and video.ndim == 4 and video.shape[0] > 0:
+        frame = video[-1]
+        if _is_channel_first_video(video):
+            frame = np.transpose(frame, (1, 2, 0))
+        return _frame_to_pil_image(frame)
+    if isinstance(video, (list, tuple)) and video:
+        return _frame_to_pil_image(video[-1])
+    return None
 
 
 def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
@@ -558,6 +641,9 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), media_type, index)
         anchor_type = _normalize_anchor_type(anchor_type_raw)
         anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
+        if _is_noop_anchor(anchor):
+            anchor = None
+            anchor_type = ANCHOR_TYPE_NONE
         shape_wh = Qwen3VLAnchorTemplate._get_shape_wh(inputs, media_type, index)
         return anchor, anchor_type, shape_wh, 'xyxy'
 
@@ -575,6 +661,38 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             inputs.mm_processor_kwargs['do_resize'] = False
         return kwargs
 
+    @staticmethod
+    def _is_debug_save_enabled(inputs) -> bool:
+        flag = inputs.extra_kwargs.get('save_anchor_preview', None)
+        if flag is None:
+            flag = inputs.extra_kwargs.get('anchor_debug_save', False)
+        return _to_bool(flag, default=False)
+
+    @staticmethod
+    def _debug_save_dir(inputs) -> str:
+        save_dir = _json_loads_maybe(inputs.extra_kwargs.get('anchor_debug_dir', 'anchor_debug_outputs'))
+        if not isinstance(save_dir, str) or not save_dir.strip():
+            return 'anchor_debug_outputs'
+        return save_dir.strip()
+
+    def _save_media_preview(self, media_type: str, index: int, media: Any, inputs, anchor_type: int) -> None:
+        if not self._is_debug_save_enabled(inputs):
+            return
+        save_dir = self._debug_save_dir(inputs)
+        os.makedirs(save_dir, exist_ok=True)
+        if media_type == 'image':
+            image = _frame_to_pil_image(media)
+        else:
+            image = _video_last_frame_to_pil(media)
+        if image is None:
+            logger.warning_once('Failed to build debug preview image from media; skip saving.')
+            return
+        ts = int(time.time() * 1000)
+        filename = f'{media_type}_{index}_{_anchor_type_name(anchor_type)}_{ts}.png'
+        path = os.path.join(save_dir, filename)
+        image.save(path)
+        logger.info(f'Anchor debug preview saved to: {path}')
+
     def _replace_image_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
                            fetch_kwargs: Dict[str, Any]):
         image_ele = {'image': inputs.images[index]}
@@ -589,6 +707,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         else:
             from qwen_vl_utils import fetch_image
             inputs.images[index] = fetch_image(image_ele, **fetch_kwargs)
+        self._save_media_preview('image', index, inputs.images[index], inputs, anchor_type)
         if self.mode == 'lmdeploy':
             return ['<|vision_start|>', [-100], '<|vision_end|>']
         return ['<|vision_start|><|image_pad|><|vision_end|>']
@@ -628,6 +747,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         if isinstance(video, torch.Tensor):
             video = video.to(torch.uint8)
         inputs.videos[index] = video
+        self._save_media_preview('video', index, inputs.videos[index], inputs, anchor_type)
         return tokens
 
     def replace_tag(self, media_type, index, inputs):
