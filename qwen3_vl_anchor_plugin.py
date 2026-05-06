@@ -112,6 +112,10 @@ def _normalize_anchor(anchor: Any,
                       anchor_format: str = 'auto') -> Optional[Tuple[int, int, int, int]]:
     if not isinstance(anchor, (list, tuple)) or len(anchor) < 4:
         return None
+    # Special case for visualization: [0,0,0,0] means full-image box.
+    # Crop mode already handles this as no-op in _collect_anchor_info.
+    if _is_noop_anchor(anchor):
+        return 0, 0, width, height
 
     _ = anchor_format  # keep signature compatibility
     x1, y1, x2, y2 = anchor[:4]
