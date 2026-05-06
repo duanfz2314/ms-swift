@@ -641,7 +641,8 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         anchor_type_raw = _pick_media_value(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), media_type, index)
         anchor_type = _normalize_anchor_type(anchor_type_raw)
         anchor = _pick_media_value(inputs.extra_kwargs.get('anchors'), media_type, index)
-        if _is_noop_anchor(anchor):
+        # [0,0,0,0] means "no crop", but draw mode should still draw it.
+        if anchor_type == ANCHOR_TYPE_CROP and _is_noop_anchor(anchor):
             anchor = None
             anchor_type = ANCHOR_TYPE_NONE
         shape_wh = Qwen3VLAnchorTemplate._get_shape_wh(inputs, media_type, index)
