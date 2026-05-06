@@ -14,7 +14,6 @@ anchor_type:
     2 -> draw rectangle by anchors
 """
 
-import json
 import math
 import os
 import time
@@ -53,7 +52,6 @@ def _normalize_anchor_type(value: Any) -> int:
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
-    value = _json_loads_maybe(value)
     if value is None:
         return default
     if isinstance(value, bool):
@@ -85,43 +83,6 @@ def _anchor_type_name(anchor_type: int) -> str:
     if anchor_type == ANCHOR_TYPE_DRAW:
         return 'draw'
     return 'none'
-
-
-def _json_loads_maybe(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        return value
-
-
-def _pick_index(value: Any, index: int) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value.get(index, value.get(str(index)))
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        if isinstance(value[0], (list, tuple, dict)):
-            return value[index] if index < len(value) else None
-        return value
-    return value
-
-
-def _pick_media_value(raw: Any, media_type: str, index: int) -> Any:
-    raw = _json_loads_maybe(raw)
-    if isinstance(raw, dict):
-        media_key = 'images' if media_type == 'image' else 'videos'
-        if media_key in raw:
-            return _pick_index(raw[media_key], index)
-        if media_type in raw:
-            return _pick_index(raw[media_type], index)
-    return _pick_index(raw, index)
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -171,23 +132,6 @@ def _normalize_anchor(anchor: Any,
     return x1, y1, x2, y2
 
 
-def _rescale_box(box: Tuple[int, int, int, int], src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int, int, int]:
-    if src_w <= 0 or src_h <= 0:
-        return box
-    x1, y1, x2, y2 = box
-    sx = dst_w / src_w
-    sy = dst_h / src_h
-    nx1 = int(round(x1 * sx))
-    ny1 = int(round(y1 * sy))
-    nx2 = int(round(x2 * sx))
-    ny2 = int(round(y2 * sy))
-    nx1 = max(0, min(nx1, dst_w - 1))
-    ny1 = max(0, min(ny1, dst_h - 1))
-    nx2 = max(1, min(nx2, dst_w))
-    ny2 = max(1, min(ny2, dst_h))
-    return nx1, ny1, nx2, ny2
-
-
 def _to_draw_box(box: Tuple[int, int, int, int], width: int, height: int, line_width: int) -> Tuple[int, int, int, int]:
     """Convert crop-style box [x1,y1,x2,y2) to visible draw box inside image."""
     x1, y1, x2, y2 = box
@@ -219,12 +163,11 @@ def _apply_anchor_to_image_obj(image: Image.Image,
                                resize_target: Optional[Tuple[int, int]] = None,
                                anchor_format: str = 'auto') -> Image.Image:
     curr_w, curr_h = image.width, image.height
-    anchor_ref_w, anchor_ref_h = shape_wh or (curr_w, curr_h)
+    _ = shape_wh
+    anchor_ref_w, anchor_ref_h = curr_w, curr_h
     box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h, anchor_format=anchor_format)
     if box is None:
         return image
-    if (anchor_ref_w, anchor_ref_h) != (curr_w, curr_h):
-        box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     if anchor_type == ANCHOR_TYPE_CROP:
         image = image.crop(box)
         if resize_after_crop:
@@ -484,12 +427,11 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         curr_h, curr_w = video.shape[1], video.shape[2]
     else:
         curr_h, curr_w = video.shape[2], video.shape[3]
-    anchor_ref_w, anchor_ref_h = shape_wh or (curr_w, curr_h)
+    _ = shape_wh
+    anchor_ref_w, anchor_ref_h = curr_w, curr_h
     box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h, anchor_format=anchor_format)
     if box is None:
         return video
-    if (anchor_ref_w, anchor_ref_h) != (curr_w, curr_h):
-        box = _rescale_box(box, anchor_ref_w, anchor_ref_h, curr_w, curr_h)
     x1, y1, x2, y2 = box
 
     if anchor_type == ANCHOR_TYPE_CROP:
@@ -641,7 +583,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     @staticmethod
     def _debug_save_dir(inputs) -> str:
-        save_dir = _json_loads_maybe(inputs.extra_kwargs.get('anchor_debug_dir', 'anchor_debug_outputs'))
+        save_dir = inputs.extra_kwargs.get('anchor_debug_dir', 'anchor_debug_outputs')
         if not isinstance(save_dir, str) or not save_dir.strip():
             return 'anchor_debug_outputs'
         return save_dir.strip()
