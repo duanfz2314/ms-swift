@@ -92,19 +92,6 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _parse_shape_wh(shape: Any) -> Optional[Tuple[int, int]]:
-    if not isinstance(shape, (list, tuple)) or len(shape) < 2:
-        return None
-    try:
-        w = int(shape[0])
-        h = int(shape[1])
-    except Exception:
-        return None
-    if w <= 0 or h <= 0:
-        return None
-    return w, h
-
-
 def _normalize_anchor(anchor: Any,
                       width: int,
                       height: int,
@@ -165,12 +152,10 @@ def _apply_anchor_to_image_obj(image: Image.Image,
                                anchor: Any,
                                anchor_type: int,
                                *,
-                               shape_wh: Optional[Tuple[int, int]] = None,
                                resize_after_crop: bool = False,
                                resize_target: Optional[Tuple[int, int]] = None,
                                anchor_format: str = 'auto') -> Image.Image:
     curr_w, curr_h = image.width, image.height
-    _ = shape_wh
     anchor_ref_w, anchor_ref_h = curr_w, curr_h
     box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h, anchor_format=anchor_format)
     if box is None:
@@ -283,7 +268,6 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
                             *,
                             anchor: Any = None,
                             anchor_type: int = 0,
-                            shape_wh: Optional[Tuple[int, int]] = None,
                             image_patch_size: int = 14,
                             anchor_format: str = 'xyxy') -> Image.Image:
     image = ele['image'] if 'image' in ele else ele['image_url']
@@ -296,7 +280,6 @@ def fetch_image_with_anchor(ele: Dict[str, Union[str, Image.Image]],
             image,
             anchor,
             anchor_type,
-            shape_wh=shape_wh,
             resize_after_crop=False,
             anchor_format=anchor_format)
 
@@ -331,7 +314,6 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
                             *,
                             anchor: Any = None,
                             anchor_type: int = 0,
-                            shape_wh: Optional[Tuple[int, int]] = None,
                             image_patch_size: int = 14,
                             return_video_sample_fps: bool = False,
                             return_video_metadata: bool = False,
@@ -375,7 +357,6 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
             video,
             anchor,
             anchor_type,
-            shape_wh=shape_wh,
             resize_after_crop=False,
             anchor_format=anchor_format)
 
@@ -419,7 +400,6 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
                                  anchor: Any,
                                  anchor_type: int,
                                  *,
-                                 shape_wh: Optional[Tuple[int, int]] = None,
                                  resize_after_crop: bool = False,
                                  anchor_format: str = 'auto') -> np.ndarray:
     if video.ndim != 4:
@@ -434,7 +414,6 @@ def _apply_anchor_to_numpy_video(video: np.ndarray,
         curr_h, curr_w = video.shape[1], video.shape[2]
     else:
         curr_h, curr_w = video.shape[2], video.shape[3]
-    _ = shape_wh
     anchor_ref_w, anchor_ref_h = curr_w, curr_h
     box = _normalize_anchor(anchor, anchor_ref_w, anchor_ref_h, anchor_format=anchor_format)
     if box is None:
@@ -475,7 +454,6 @@ def _apply_anchor_to_torch_video(video: torch.Tensor,
                                  anchor: Any,
                                  anchor_type: int,
                                  *,
-                                 shape_wh: Optional[Tuple[int, int]] = None,
                                  resize_after_crop: bool = False,
                                  anchor_format: str = 'auto') -> torch.Tensor:
     if video.ndim != 4:
@@ -487,7 +465,6 @@ def _apply_anchor_to_torch_video(video: torch.Tensor,
         video_np,
         anchor,
         anchor_type,
-        shape_wh=shape_wh,
         resize_after_crop=resize_after_crop,
         anchor_format=anchor_format)
     out = torch.from_numpy(out_np).to(video.device)
@@ -500,7 +477,6 @@ def _apply_anchor_to_video(video: Any,
                            anchor: Any,
                            anchor_type: int,
                            *,
-                           shape_wh: Optional[Tuple[int, int]] = None,
                            resize_after_crop: bool = False,
                            anchor_format: str = 'auto') -> Any:
     if anchor_type == ANCHOR_TYPE_NONE:
@@ -510,7 +486,6 @@ def _apply_anchor_to_video(video: Any,
             video,
             anchor,
             anchor_type,
-            shape_wh=shape_wh,
             resize_after_crop=resize_after_crop,
             anchor_format=anchor_format)
     if isinstance(video, np.ndarray):
@@ -518,7 +493,6 @@ def _apply_anchor_to_video(video: Any,
             video,
             anchor,
             anchor_type,
-            shape_wh=shape_wh,
             resize_after_crop=resize_after_crop,
             anchor_format=anchor_format)
     if isinstance(video, (list, tuple)) and video:
@@ -531,9 +505,8 @@ def _apply_anchor_to_video(video: Any,
                     img,
                     anchor,
                     anchor_type,
-                    shape_wh=shape_wh,
                     resize_after_crop=resize_after_crop and (anchor_type == ANCHOR_TYPE_CROP),
-                    resize_target=shape_wh or (img.width, img.height),
+                    resize_target=(img.width, img.height),
                     anchor_format=anchor_format)
                 processed.append(np.asarray(img))
             except Exception:
@@ -545,18 +518,7 @@ def _apply_anchor_to_video(video: Any,
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     @staticmethod
-    def _get_shape_wh(inputs, media_type: str, index: int) -> Optional[Tuple[int, int]]:
-        _ = index  # shape is a single list [w, h] under current data contract.
-        if media_type == 'image':
-            shape_raw = inputs.extra_kwargs.get('image_shape')
-        else:
-            shape_raw = inputs.extra_kwargs.get('video_shape')
-        if shape_raw is None:
-            shape_raw = inputs.extra_kwargs.get('shape')
-        return _parse_shape_wh(shape_raw)
-
-    @staticmethod
-    def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, Optional[Tuple[int, int]], str]:
+    def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, str]:
         _ = media_type, index  # keep signature stable; inputs are scalar/list for current sample.
         anchor_type = _normalize_anchor_type(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE))
         anchor = inputs.extra_kwargs.get('anchors')
@@ -564,8 +526,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         if anchor_type == ANCHOR_TYPE_CROP and _is_noop_anchor(anchor):
             anchor = None
             anchor_type = ANCHOR_TYPE_NONE
-        shape_wh = Qwen3VLAnchorTemplate._get_shape_wh(inputs, media_type, index)
-        return anchor, anchor_type, shape_wh, 'xyxy'
+        return anchor, anchor_type, 'xyxy'
 
     @staticmethod
     def _append_anchor_kwargs(media_type: str, inputs, anchor: Any, anchor_type: int) -> None:
@@ -613,7 +574,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         image.save(path)
         logger.info(f'Anchor debug preview saved to: {path}')
 
-    def _replace_image_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
+    def _replace_image_tag(self, index: int, inputs, anchor: Any, anchor_type: int, anchor_format: str,
                            fetch_kwargs: Dict[str, Any]):
         image_ele = {'image': inputs.images[index]}
         if _has_anchor_operation(anchor, anchor_type):
@@ -621,7 +582,6 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 image_ele,
                 anchor=anchor,
                 anchor_type=anchor_type,
-                shape_wh=shape_wh,
                 anchor_format=anchor_format,
                 **fetch_kwargs)
         else:
@@ -632,7 +592,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             return ['<|vision_start|>', [-100], '<|vision_end|>']
         return ['<|vision_start|><|image_pad|><|vision_end|>']
 
-    def _replace_video_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
+    def _replace_video_tag(self, index: int, inputs, anchor: Any, anchor_type: int, anchor_format: str,
                            fetch_kwargs: Dict[str, Any]):
         video_fetch_kwargs = dict(fetch_kwargs)
         if self.version == 'v3':
@@ -648,7 +608,6 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
                 return_video_sample_fps=True,
                 anchor=anchor,
                 anchor_type=anchor_type,
-                shape_wh=shape_wh,
                 anchor_format=anchor_format,
                 **video_fetch_kwargs)
         else:
@@ -673,12 +632,12 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
     def replace_tag(self, media_type, index, inputs):
         if media_type not in {'image', 'video'}:
             return super().replace_tag(media_type, index, inputs)
-        anchor, anchor_type, shape_wh, anchor_format = self._collect_anchor_info(media_type, index, inputs)
+        anchor, anchor_type, anchor_format = self._collect_anchor_info(media_type, index, inputs)
         self._append_anchor_kwargs(media_type, inputs, anchor, anchor_type)
         fetch_kwargs = self._build_fetch_kwargs(inputs)
         if media_type == 'image':
-            return self._replace_image_tag(index, inputs, anchor, anchor_type, shape_wh, anchor_format, fetch_kwargs)
-        return self._replace_video_tag(index, inputs, anchor, anchor_type, shape_wh, anchor_format, fetch_kwargs)
+            return self._replace_image_tag(index, inputs, anchor, anchor_type, anchor_format, fetch_kwargs)
+        return self._replace_video_tag(index, inputs, anchor, anchor_type, anchor_format, fetch_kwargs)
 
     def _encode(self, inputs):
         # Fallback if processor does not accept custom anchor kwargs.
