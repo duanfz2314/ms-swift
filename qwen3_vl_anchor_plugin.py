@@ -151,6 +151,9 @@ def _to_draw_box(box: Tuple[int, int, int, int], width: int, height: int, line_w
         right = max(left, width - 1 - inset)
     if bottom == height - 1:
         bottom = max(top, height - 1 - inset)
+    # Inset adjustments can flip narrow boxes; enforce valid draw order.
+    right = max(right, left)
+    bottom = max(bottom, top)
     return left, top, right, bottom
 
 
