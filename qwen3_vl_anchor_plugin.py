@@ -70,12 +70,6 @@ def _to_bool(value: Any, default: bool = False) -> bool:
 
 
 def _is_noop_anchor(anchor: Any) -> bool:
-    anchor = _json_loads_maybe(anchor)
-    if isinstance(anchor, dict):
-        if 'bbox' in anchor:
-            anchor = anchor['bbox']
-        else:
-            anchor = [anchor.get('x1'), anchor.get('y1'), anchor.get('x2'), anchor.get('y2')]
     if not isinstance(anchor, (list, tuple)) or len(anchor) < 4:
         return False
     try:
@@ -138,18 +132,6 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 
 def _parse_shape_wh(shape: Any) -> Optional[Tuple[int, int]]:
-    shape = _json_loads_maybe(shape)
-    if shape is None:
-        return None
-    if isinstance(shape, dict):
-        if 'shape' in shape:
-            shape = shape['shape']
-        elif 'size' in shape:
-            shape = shape['size']
-        elif 'w' in shape and 'h' in shape:
-            shape = [shape['w'], shape['h']]
-        elif 'width' in shape and 'height' in shape:
-            shape = [shape['width'], shape['height']]
     if not isinstance(shape, (list, tuple)) or len(shape) < 2:
         return None
     try:
@@ -167,42 +149,17 @@ def _normalize_anchor(anchor: Any,
                       height: int,
                       *,
                       anchor_format: str = 'auto') -> Optional[Tuple[int, int, int, int]]:
-    if anchor is None:
-        return None
-    anchor = _json_loads_maybe(anchor)
-
-    if isinstance(anchor, dict):
-        if 'bbox' in anchor:
-            anchor = anchor['bbox']
-        else:
-            anchor = [anchor.get('x1'), anchor.get('y1'), anchor.get('x2'), anchor.get('y2')]
-
     if not isinstance(anchor, (list, tuple)) or len(anchor) < 4:
         return None
 
-    a, b, c, d = anchor[:4]
+    _ = anchor_format  # keep signature compatibility
+    x1, y1, x2, y2 = anchor[:4]
     try:
-        a, b, c, d = float(a), float(b), float(c), float(d)
+        x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
     except Exception:
         return None
 
-    if anchor_format != 'xyxy':
-        logger.warning_once(f'Only xyxy anchor_format is supported, got {anchor_format}. Fallback to xyxy.')
-    if max(abs(a), abs(b), abs(c), abs(d)) > 1.0:
-        # Heuristic: anchors are xyxy; if they do not fit (w,h) but fit (h,w), swap ref dims.
-        max_x = max(a, c)
-        max_y = max(b, d)
-        if (max_x > width or max_y > height) and (max_x <= height and max_y <= width):
-            width, height = height, width
-            logger.warning_once(
-                'Anchor appears to use swapped reference shape (h,w). Auto-correcting to (w,h) for drawing/crop.')
-    x1, y1, x2, y2 = a, b, c, d
-
-    # If coords are in [0,1], treat as normalized.
-    if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.0:
-        x1, x2 = x1 * width, x2 * width
-        y1, y2 = y1 * height, y2 * height
-
+    # Absolute xyxy coordinates only.
     x1, x2 = sorted((int(round(x1)), int(round(x2))))
     y1, y2 = sorted((int(round(y1)), int(round(y2))))
     x1 = max(0, min(x1, width - 1))
