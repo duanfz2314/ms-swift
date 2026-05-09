@@ -17,6 +17,18 @@ from typing import Any, Dict, List
 
 from swift import BaseArguments, RequestConfig, TransformersEngine, get_template
 
+TRAINING_ONLY_KEYS = {
+    'query',
+    'prompt',
+    'text',
+    'response',
+    'from',
+    'label',
+    'labels',
+    'label_type',
+    'cls_label',
+}
+
 
 def str2bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -46,8 +58,8 @@ def parse_args() -> argparse.Namespace:
         '--remove-unused-columns',
         '--remove_unused_columns',
         type=str2bool,
-        default=False,
-        help='Forwarded to get_template(remove_unused_columns=...).')
+        default=True,
+        help='Forwarded to get_template(remove_unused_columns=...). Recommend true for inference.')
     parser.add_argument('--model', type=str, default=None, help='Base model path/id. Defaults to adapter args.json.')
     parser.add_argument('--template', type=str, default=None, help='Template name. Defaults to adapter args.json.')
     parser.add_argument('--system', type=str, default=None, help='Override system prompt.')
@@ -123,10 +135,20 @@ def normalize_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
             value = item.pop(singular)
             item[plural] = value if isinstance(value, list) else [value]
     if 'messages' not in item:
-        query = item.get('query') or item.get('prompt') or item.get('text')
+        query = item.pop('query', None) or item.pop('prompt', None) or item.pop('text', None)
         if query is None:
             raise ValueError('Sample missing `messages` and no fallback `query/prompt/text` found.')
         item['messages'] = [{'role': 'user', 'content': query}]
+    else:
+        # Remove training-only text aliases to avoid forwarding them into model kwargs.
+        item.pop('query', None)
+        item.pop('prompt', None)
+        item.pop('text', None)
+
+    for key in TRAINING_ONLY_KEYS:
+        if key in {'query', 'prompt', 'text'}:
+            continue
+        item.pop(key, None)
     if not isinstance(item['messages'], list) or not item['messages']:
         raise ValueError(f'`messages` must be a non-empty list. Got: {item.get("messages")}')
     return item
