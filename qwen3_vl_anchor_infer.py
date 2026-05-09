@@ -18,12 +18,36 @@ from typing import Any, Dict, List
 from swift import BaseArguments, RequestConfig, TransformersEngine, get_template
 
 
+def str2bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if text in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    raise argparse.ArgumentTypeError(f'Invalid boolean value: {value}')
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Infer JSON/JSONL with Qwen3-VL LoRA + anchor plugin.')
     parser.add_argument('--adapter-path', type=str, required=True, help='LoRA checkpoint directory.')
     parser.add_argument('--input-file', type=str, required=True, help='Input .json or .jsonl file.')
     parser.add_argument('--output-file', type=str, required=True, help='Output .json or .jsonl file.')
-    parser.add_argument('--external-plugin', type=str, default='qwen3_vl_anchor_plugin.py', help='Plugin path.')
+    parser.add_argument(
+        '--external-plugins',
+        '--external_plugins',
+        '--external-plugin',
+        dest='external_plugins',
+        nargs='+',
+        default=['qwen3_vl_anchor_plugin.py'],
+        help='One or multiple external plugin paths.')
+    parser.add_argument(
+        '--remove-unused-columns',
+        '--remove_unused_columns',
+        type=str2bool,
+        default=False,
+        help='Forwarded to get_template(remove_unused_columns=...).')
     parser.add_argument('--model', type=str, default=None, help='Base model path/id. Defaults to adapter args.json.')
     parser.add_argument('--template', type=str, default=None, help='Template name. Defaults to adapter args.json.')
     parser.add_argument('--system', type=str, default=None, help='Override system prompt.')
@@ -136,13 +160,14 @@ def build_engine(args: argparse.Namespace) -> TransformersEngine:
         engine.processor,
         default_system=default_system,
         template_type=template_type,
-        remove_unused_columns=False)
+        remove_unused_columns=args.remove_unused_columns)
     return engine
 
 
 def main() -> None:
     args = parse_args()
-    import_external_plugin(Path(args.external_plugin))
+    for plugin in args.external_plugins:
+        import_external_plugin(Path(plugin))
     engine = build_engine(args)
 
     samples = load_samples(Path(args.input_file))
