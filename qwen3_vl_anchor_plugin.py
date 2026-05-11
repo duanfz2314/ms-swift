@@ -6,7 +6,9 @@ Usage:
       --dataset /path/to/train.jsonl \
       --external_plugins /workspace/qwen3_vl_anchor_plugin.py \
       --template qwen3_vl_anchor \
-      --remove_unused_columns false
+      --remove_unused_columns false \
+      --acc_strategy token \
+      --metric_for_best_model token_acc
 
 anchor_type:
     0 -> no processing
