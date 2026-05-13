@@ -17,7 +17,101 @@ if [[ ! -d "${MV_BENCH_DATA_ROOT}/json" || ! -d "${MV_BENCH_DATA_ROOT}/video" ]]
   exit 1
 fi
 
-mkdir -p "${MV_BENCH_CACHE_ROOT}/refs" "${MV_BENCH_CACHE_ROOT}/snapshots"
+MV_BENCH_DATA_ROOT="${MV_BENCH_DATA_ROOT}" python3 - <<'PY'
+import json
+import os
+import shutil
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
+root = Path(os.environ['MV_BENCH_DATA_ROOT'])
+video_root = root / 'video'
+data_file = root / 'MVBench.tsv'
+
+for zip_path in video_root.glob('*.zip'):
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(video_root)
+
+src_folder = video_root / 'data0613'
+if src_folder.exists():
+    for subdir in src_folder.iterdir():
+        if not subdir.is_dir():
+            continue
+        for subsubdir in subdir.iterdir():
+            if not subsubdir.is_dir():
+                continue
+            target_folder = video_root / subdir.name / subsubdir.name
+            target_folder.mkdir(parents=True, exist_ok=True)
+            for item in subsubdir.iterdir():
+                target_path = target_folder / item.name
+                if not target_path.exists():
+                    shutil.move(str(item), str(target_path))
+
+type_data_list = {
+    'Action Sequence': ('action_sequence.json', 'video/star/Charades_v1_480/', 'video', True),
+    'Action Prediction': ('action_prediction.json', 'video/star/Charades_v1_480/', 'video', True),
+    'Action Antonym': ('action_antonym.json', 'video/ssv2_video/', 'video', False),
+    'Fine-grained Action': ('fine_grained_action.json', 'video/Moments_in_Time_Raw/videos/', 'video', False),
+    'Unexpected Action': ('unexpected_action.json', 'video/FunQA_test/test/', 'video', False),
+    'Object Existence': ('object_existence.json', 'video/clevrer/video_validation/', 'video', False),
+    'Object Interaction': ('object_interaction.json', 'video/star/Charades_v1_480/', 'video', True),
+    'Object Shuffle': ('object_shuffle.json', 'video/perception/videos/', 'video', False),
+    'Moving Direction': ('moving_direction.json', 'video/clevrer/video_validation/', 'video', False),
+    'Action Localization': ('action_localization.json', 'video/sta/sta_video/', 'video', True),
+    'Scene Transition': ('scene_transition.json', 'video/scene_qa/video/', 'video', False),
+    'Action Count': ('action_count.json', 'video/perception/videos/', 'video', False),
+    'Moving Count': ('moving_count.json', 'video/clevrer/video_validation/', 'video', False),
+    'Moving Attribute': ('moving_attribute.json', 'video/clevrer/video_validation/', 'video', False),
+    'State Change': ('state_change.json', 'video/perception/videos/', 'video', False),
+    'Fine-grained Pose': ('fine_grained_pose.json', 'video/nturgbd/', 'video', False),
+    'Character Order': ('character_order.json', 'video/perception/videos/', 'video', False),
+    'Egocentric Navigation': ('egocentric_navigation.json', 'video/vlnqa/', 'video', False),
+    'Episodic Reasoning': ('episodic_reasoning.json', 'video/tvqa/frames_fps3_hq/', 'frame', True),
+    'Counterfactual Inference': ('counterfactual_inference.json', 'video/clevrer/video_validation/', 'video', False),
+}
+
+rows = []
+missing = []
+json_root = root / 'json'
+for task_type, (json_name, prefix, data_type, bound) in type_data_list.items():
+    json_path = json_root / json_name
+    if not json_path.exists():
+        raise FileNotFoundError(f'Missing annotation file: {json_path}')
+    with json_path.open('r') as f:
+        items = json.load(f)
+    for item in items:
+        video_path = root / prefix / item['video']
+        if not video_path.exists():
+            missing.append(str(video_path))
+            continue
+        rows.append({
+            'task_type': task_type,
+            'prefix': prefix,
+            'data_type': data_type,
+            'bound': bound,
+            'start': item['start'] if 'start' in item else None,
+            'end': item['end'] if 'end' in item else None,
+            'video': item['video'],
+            'question': item['question'],
+            'answer': item['answer'],
+            'candidates': item['candidates'],
+        })
+
+if missing:
+    preview = '\n'.join(missing[:20])
+    raise FileNotFoundError(
+        f'MVBench has {len(missing)} missing video/frame paths. First missing paths:\n{preview}'
+    )
+
+df = pd.DataFrame(rows)
+df = df.assign(index=range(len(df)))
+df.to_csv(data_file, sep='\t', index=False)
+print(f'Prepared {data_file} with {len(df)} samples.')
+PY
+
+mkdir -p "${MV_BENCH_CACHE_ROOT}/blobs" "${MV_BENCH_CACHE_ROOT}/refs" "${MV_BENCH_CACHE_ROOT}/snapshots"
 ln -sfn "${MV_BENCH_DATA_ROOT}" "${MV_BENCH_CACHE_ROOT}/snapshots/${MV_BENCH_CACHE_REVISION}"
 printf '%s' "${MV_BENCH_CACHE_REVISION}" > "${MV_BENCH_CACHE_ROOT}/refs/main"
 
