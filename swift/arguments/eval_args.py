@@ -101,14 +101,20 @@ class EvalArguments(DeployArguments):
             self.eval_dataset = [self.eval_dataset]
 
         all_eval_dataset = self.list_eval_dataset(self.eval_backend)
-        dataset_mapping = {dataset.lower(): dataset for dataset in all_eval_dataset[self.eval_backend]}
+        supported_datasets = all_eval_dataset[self.eval_backend]
+        dataset_mapping = {}
+        for dataset in supported_datasets:
+            dataset_mapping.setdefault(dataset.lower(), dataset)
         valid_dataset = []
         for dataset in self.eval_dataset:
-            if dataset.lower() not in dataset_mapping:
+            if dataset in supported_datasets:
+                valid_dataset.append(dataset)
+            elif dataset.lower() in dataset_mapping:
+                valid_dataset.append(dataset_mapping[dataset.lower()])
+            else:
                 raise ValueError(
                     f'eval_dataset: {dataset} is not supported.\n'
-                    f'eval_backend: {self.eval_backend} supported datasets: {all_eval_dataset[self.eval_backend]}')
-            valid_dataset.append(dataset_mapping[dataset.lower()])
+                    f'eval_backend: {self.eval_backend} supported datasets: {supported_datasets}')
         self.eval_dataset = valid_dataset
 
         logger.info(f'eval_backend: {self.eval_backend}')
