@@ -38,6 +38,8 @@ class EvalArguments(DeployArguments):
         temperature (float): The temperature for sampling, which overrides the default generation config. Defaults
             to 0.0.
         verbose (bool): Whether to output verbose information during the evaluation process. Defaults to False.
+        log_interval (int): The interval in seconds for printing deploy tokens/s statistics. Set to -1 to disable.
+            Defaults to -1 for eval to avoid periodic stats noise during long-running evaluation.
         eval_num_proc (int): The maximum number of concurrent clients for evaluation. Defaults to 16.
         extra_eval_args (Optional[Union[Dict, str]]): Additional evaluation arguments, provided as a JSON string.
             These are only effective when using the 'Native' backend. Refer to the documentation for more details on
@@ -56,6 +58,7 @@ class EvalArguments(DeployArguments):
 
     temperature: Optional[float] = 0.
     verbose: bool = False
+    log_interval: int = -1
     eval_num_proc: int = 16
     extra_eval_args: Optional[Union[dict, str]] = field(default_factory=dict)
     # If eval_url is set, ms-swift will not perform deployment operations and

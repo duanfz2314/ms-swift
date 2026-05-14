@@ -5,6 +5,11 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 infer_backend = 'transformers'
 
 
+def test_eval_default_log_interval():
+    from swift import EvalArguments
+    assert EvalArguments.__dataclass_fields__['log_interval'].default == -1
+
+
 def test_eval_native():
     from swift import EvalArguments, eval_main
     eval_main(
