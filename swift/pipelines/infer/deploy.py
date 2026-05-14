@@ -65,6 +65,8 @@ class SwiftDeploy(SwiftInfer):
 
     def _compute_infer_stats(self):
         global_stats = self.infer_stats.compute()
+        if global_stats['num_samples'] == 0:
+            return
         for k, v in global_stats.items():
             global_stats[k] = round(v, 8)
         logger.info(global_stats)
