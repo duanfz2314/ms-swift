@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import socket
 from contextlib import nullcontext
 from evalscope.constants import EvalBackend, EvalType
 from evalscope.run import TaskConfig, run_task
@@ -9,6 +10,7 @@ from typing import List, Optional, Union
 from swift.arguments import EvalArguments
 from swift.dataset import MediaResource
 from swift.utils import append_to_jsonl, get_logger
+from transformers.utils import strtobool
 from ..base import SwiftPipeline
 from ..infer import run_deploy
 
@@ -88,6 +90,51 @@ class SwiftEval(SwiftPipeline):
             task_cfg = self.get_native_task_cfg(dataset, url)
         return task_cfg
 
+    @staticmethod
+    def _get_env_bool(name: str) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return False
+        try:
+            return bool(strtobool(value))
+        except ValueError:
+            return False
+
+    def _is_vlmeval_offline(self) -> bool:
+        if self._get_env_bool('SWIFT_SKIP_VLMEVAL_DATA_CHECK'):
+            return False
+        if any(
+                self._get_env_bool(name)
+                for name in ('SWIFT_OFFLINE', 'HF_HUB_OFFLINE', 'MODELSCOPE_OFFLINE', 'EVALSCOPE_OFFLINE')):
+            return True
+
+        # If proxy is configured, leave network checking to downstream libs.
+        if any(os.environ.get(name) for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')):
+            return False
+
+        for host in ('www.modelscope.cn', 'huggingface.co'):
+            try:
+                with socket.create_connection((host, 443), timeout=1.5):
+                    return False
+            except OSError:
+                continue
+        return True
+
+    def _check_vlmeval_data_availability(self, dataset: List[str]) -> None:
+        if self._get_env_bool('SWIFT_SKIP_VLMEVAL_DATA_CHECK'):
+            return
+        lmu_data_dir = os.path.expanduser(os.environ.get('LMU_DATA_DIR', '~/LMUData'))
+        cache_ready = os.path.isdir(lmu_data_dir) and any(os.scandir(lmu_data_dir))
+        if cache_ready or not self._is_vlmeval_offline():
+            return
+
+        raise RuntimeError(
+            'VLMEvalKit requires benchmark data under `~/LMUData` in offline mode, '
+            f'but no cached data was found at `{lmu_data_dir}`. '
+            f'Current dataset(s): {dataset}. '
+            'Please pre-download datasets on a machine with network access and copy them to this server, '
+            'or set `SWIFT_SKIP_VLMEVAL_DATA_CHECK=1` to bypass this pre-check.')
+
     def get_native_task_cfg(self, dataset: List[str], url: str):
         args = self.args
         work_dir = os.path.join(args.eval_output_dir, 'native')
@@ -133,6 +180,7 @@ class SwiftEval(SwiftPipeline):
     def get_vlmeval_task_cfg(self, dataset: List[str], url: str):
         # Must use chat/completion endpoint
         url = f"{url.rstrip('/')}/chat/completions"
+        self._check_vlmeval_data_availability(dataset)
 
         args = self.args
         work_dir = os.path.join(args.eval_output_dir, 'vlmeval')

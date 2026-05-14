@@ -56,6 +56,9 @@ class EvalArguments(DeployArguments):
 
     temperature: Optional[float] = 0.
     verbose: bool = False
+    # Eval spawns a local deploy server under the hood. Disable periodic infer stats logging by default
+    # to avoid noisy `num_prompt_tokens/num_samples=0` output during dataset preparation or idle periods.
+    log_interval: int = -1
     eval_num_proc: int = 16
     extra_eval_args: Optional[Union[dict, str]] = field(default_factory=dict)
     # If eval_url is set, ms-swift will not perform deployment operations and
