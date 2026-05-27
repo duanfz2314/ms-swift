@@ -109,6 +109,7 @@ sequence parallel和自定义loss冲突时，由于sequence parallel在自己的
 SWIFT中的LlamaPro对多模态做了适配。
 LongLoRA只有LLaMA系列模型能用。
 LoRA训练和`--trainable_parameters`参数不兼容，LoRA模块之外其他的可训练参数用modules_to_save。
+如果同时设置了`--adapters`（或`--resume_from_checkpoint`）和LoRA结构参数（如`--lora_rank`、`--target_modules`），训练会以adapter里的`adapter_config.json`为准，外部这些LoRA结构参数不会生效。如需修改LoRA结构参数，请不要加载已有adapter，改为重新初始化训练。
 
 ### Q23: embedding/reranker训练
 [embedding训练例子](https://github.com/modelscope/ms-swift/blob/main/examples/train/embedding)。

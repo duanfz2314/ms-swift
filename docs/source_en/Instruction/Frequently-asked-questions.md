@@ -109,6 +109,7 @@ To expand the vocabulary using the Swift framework, you need to set the command-
 LlamaPro in Swift has been adapted for multimodal tasks.
 LongLoRA can only be used with LLaMA-series models.
 LoRA training is incompatible with the `--trainable_parameters` parameter. For other trainable parameters outside the LoRA modules, use modules_to_save.
+If you set `--adapters` (or `--resume_from_checkpoint`) together with LoRA structural arguments (for example, `--lora_rank` or `--target_modules`), training will follow the adapter's `adapter_config.json`, and those external LoRA structural arguments will be ignored. To change LoRA structural hyperparameters, do not load an existing adapter; reinitialize a new LoRA run instead.
 
 ### Q23: Embedding/Reranker Training
 [Example](https://github.com/modelscope/ms-swift/blob/main/examples/train/embedding) for training embeddings.

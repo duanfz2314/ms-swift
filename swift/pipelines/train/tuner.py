@@ -15,6 +15,48 @@ from swift.utils import (activate_parameters, find_all_linears, find_embedding, 
 
 logger = get_logger()
 
+_LORA_ARG_NAMES_LOADED_FROM_ADAPTER = {
+    'target_modules',
+    'target_regex',
+    'target_parameters',
+    'modules_to_save',
+    'lora_rank',
+    'lora_alpha',
+    'lora_dropout',
+    'lora_bias',
+    'lora_dtype',
+    'lorap_lr_ratio',
+    'use_rslora',
+    'use_dora',
+    'init_weights',
+}
+
+
+def _get_explicit_cli_args(args, arg_names):
+    raw_argv = getattr(args, '_raw_argv', None) or []
+    explicit_args = set()
+    for token in raw_argv:
+        if not isinstance(token, str) or not token.startswith('--'):
+            continue
+        arg_name = token[2:].split('=', 1)[0].replace('-', '_')
+        if arg_name in arg_names:
+            explicit_args.add(arg_name)
+    return sorted(explicit_args)
+
+
+def _warn_ignored_lora_args(args):
+    if args.tuner_type not in {'lora', 'longlora'}:
+        return
+    explicit_args = _get_explicit_cli_args(args, _LORA_ARG_NAMES_LOADED_FROM_ADAPTER)
+    if not explicit_args:
+        return
+    trigger = '--resume_from_checkpoint' if args.resume_from_checkpoint else '--adapters'
+    ignored_args = ', '.join(f'--{arg_name}' for arg_name in explicit_args)
+    logger.warning_once(
+        f'{trigger} loads LoRA structure from checkpoint adapter_config.json, '
+        f'so these CLI args are ignored: {ignored_args}. '
+        'To apply new LoRA hyperparameters, start training without --adapters/--resume_from_checkpoint.')
+
 
 def apply_liger(model_type: str):
     try:
@@ -337,6 +379,7 @@ class TunerMixin:
                     tuner: Tuner = tuners_map[args.tuner_type]
                 else:
                     tuner = Swift
+                _warn_ignored_lora_args(args)
                 assert not args.adapters or len(args.adapters) == 1, f'args.adapters: {args.adapters}'
                 model = tuner.from_pretrained(model, args.resume_from_checkpoint or args.adapters[0], is_trainable=True)
             else:

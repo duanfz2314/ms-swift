@@ -179,7 +179,9 @@ def parse_args(class_type: Type[_T], argv: Optional[List[str]] = None) -> Tuple[
         argv = json.loads(_ray_args)
     elif argv is None:
         argv = sys.argv[1:]
+    raw_argv = list(argv)
     args, remaining_args = parser.parse_args_into_dataclasses(argv, return_remaining_strings=True)
+    setattr(args, '_raw_argv', raw_argv)
     return args, remaining_args
 
 
