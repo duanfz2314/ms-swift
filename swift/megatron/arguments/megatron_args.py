@@ -789,13 +789,18 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         mapping = {'r': 'lora_rank', 'bias': 'lora_bias'}
         for k in ['lora_alpha', 'lora_dropout', 'use_rslora']:
             mapping[k] = k
+        explicit_args = getattr(self, '_explicit_args', set())
         for k, v in adapter_config.items():
             if k not in mapping:
                 continue
-            k = mapping[k]
-            if v != getattr(self, k):
-                setattr(self, k, v)
-                logger.info(f'Setting {k}: {v}')
+            arg_name = mapping[k]
+            if arg_name in explicit_args:
+                logger.info(f'Keeping explicitly set {arg_name}: {getattr(self, arg_name)} '
+                            f'(adapter_config.json has {k}: {v})')
+                continue
+            if v != getattr(self, arg_name):
+                setattr(self, arg_name, v)
+                logger.info(f'Setting {arg_name}: {v}')
 
     def init_iters(self, train_dataset, val_dataset):
         data_parallel_size = mpu.get_data_parallel_world_size()

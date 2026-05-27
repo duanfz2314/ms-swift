@@ -171,6 +171,16 @@ def _patch_get_type_hints():
         hf_argparser.get_type_hints = origin_get_type_hints
 
 
+def _get_explicit_args(argv: List[str]) -> set:
+    """Extract argument names that were explicitly provided in argv."""
+    explicit = set()
+    for arg in argv:
+        if arg.startswith('--'):
+            key = arg.lstrip('-').split('=')[0]
+            explicit.add(key)
+    return explicit
+
+
 def parse_args(class_type: Type[_T], argv: Optional[List[str]] = None) -> Tuple[_T, List[str]]:
     with _patch_get_type_hints():
         parser = HfArgumentParser([class_type])
@@ -180,6 +190,7 @@ def parse_args(class_type: Type[_T], argv: Optional[List[str]] = None) -> Tuple[
     elif argv is None:
         argv = sys.argv[1:]
     args, remaining_args = parser.parse_args_into_dataclasses(argv, return_remaining_strings=True)
+    args._explicit_args = _get_explicit_args(argv)
     return args, remaining_args
 
 

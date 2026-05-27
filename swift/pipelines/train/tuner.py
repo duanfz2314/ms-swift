@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import os
 import torch
 import transformers
 from packaging import version
 from transformers import TrainingArguments
-from typing import List, Union
+from typing import List, Set, Union
 
 from swift.arguments import SftArguments
 from swift.trainers import calculate_max_steps
@@ -14,6 +15,11 @@ from swift.utils import (activate_parameters, find_all_linears, find_embedding, 
                          get_logger, get_multimodal_target_regex)
 
 logger = get_logger()
+
+LORA_STRUCTURE_ARGS = {
+    'lora_rank', 'lora_alpha', 'lora_dropout', 'lora_bias', 'target_modules', 'target_regex', 'modules_to_save',
+    'use_rslora', 'use_dora',
+}
 
 
 def apply_liger(model_type: str):
@@ -316,6 +322,58 @@ def prepare_adapter(args: SftArguments, model, *, template=None, train_dataset=N
     return model
 
 
+def _has_explicit_lora_args(args) -> Set[str]:
+    """Return the set of LoRA structure args explicitly provided on the CLI."""
+    explicit_args = getattr(args, '_explicit_args', set())
+    return LORA_STRUCTURE_ARGS & explicit_args
+
+
+def _load_compatible_adapter_weights(model, adapter_path: str) -> None:
+    """Load weights from an adapter checkpoint that are compatible with the current model structure.
+
+    When the user overrides LoRA structure params (e.g. rank or target_modules), the adapter
+    weights may only partially match the new structure. This function loads whatever weights
+    are compatible (matching key names and tensor shapes) and skips the rest.
+    """
+    weight_files = [
+        os.path.join(adapter_path, 'adapter_model.safetensors'),
+        os.path.join(adapter_path, 'default', 'adapter_model.safetensors'),
+        os.path.join(adapter_path, 'adapter_model.bin'),
+        os.path.join(adapter_path, 'default', 'adapter_model.bin'),
+    ]
+    weight_file = None
+    for f in weight_files:
+        if os.path.exists(f):
+            weight_file = f
+            break
+
+    if weight_file is None:
+        logger.warning(f'No adapter weight file found in {adapter_path}, skipping weight loading.')
+        return
+
+    if weight_file.endswith('.safetensors'):
+        from safetensors.torch import load_file
+        ckpt_state_dict = load_file(weight_file)
+    else:
+        ckpt_state_dict = torch.load(weight_file, map_location='cpu', weights_only=True)
+
+    model_state_dict = model.state_dict()
+    compatible_state_dict = {}
+    skipped_keys = []
+    for key, value in ckpt_state_dict.items():
+        if key in model_state_dict and model_state_dict[key].shape == value.shape:
+            compatible_state_dict[key] = value
+        else:
+            skipped_keys.append(key)
+
+    if compatible_state_dict:
+        model.load_state_dict(compatible_state_dict, strict=False)
+        logger.info(f'Loaded {len(compatible_state_dict)} compatible adapter weights from {weight_file}.')
+    if skipped_keys:
+        logger.info(f'Skipped {len(skipped_keys)} incompatible adapter weights '
+                    f'(structure mismatch due to overridden LoRA params).')
+
+
 class TunerMixin:
 
     @classmethod
@@ -333,12 +391,27 @@ class TunerMixin:
                 # resume_from_checkpoint, so do not disable grad here
                 model.requires_grad_(False)
             if args.resume_from_checkpoint or args.adapters:
-                if args.tuner_type in tuners_map:
-                    tuner: Tuner = tuners_map[args.tuner_type]
+                explicit_lora_args = _has_explicit_lora_args(args)
+                if (args.adapters and explicit_lora_args and not args.resume_from_checkpoint
+                        and args.tuner_backend != 'unsloth'):
+                    assert len(args.adapters) == 1, f'args.adapters: {args.adapters}'
+                    logger.info(f'Overriding adapter config with explicitly specified '
+                                f'LoRA params: {explicit_lora_args}')
+                    if args.tuner_type in tuners_map:
+                        tuner: Tuner = tuners_map[args.tuner_type]
+                        model = tuner.prepare_model(args, model)
+                    else:
+                        model = prepare_adapter(
+                            args, model, template=template, train_dataset=train_dataset, task_type=task_type)
+                    _load_compatible_adapter_weights(model, args.adapters[0])
                 else:
-                    tuner = Swift
-                assert not args.adapters or len(args.adapters) == 1, f'args.adapters: {args.adapters}'
-                model = tuner.from_pretrained(model, args.resume_from_checkpoint or args.adapters[0], is_trainable=True)
+                    if args.tuner_type in tuners_map:
+                        tuner: Tuner = tuners_map[args.tuner_type]
+                    else:
+                        tuner = Swift
+                    assert not args.adapters or len(args.adapters) == 1, f'args.adapters: {args.adapters}'
+                    model = tuner.from_pretrained(
+                        model, args.resume_from_checkpoint or args.adapters[0], is_trainable=True)
             else:
                 if args.tuner_type in tuners_map:
                     tuner: Tuner = tuners_map[args.tuner_type]
