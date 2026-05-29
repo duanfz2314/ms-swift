@@ -13,21 +13,21 @@ Defaults (for qwen3_vl_anchor training):
 Example:
     python llava_to_messages.py \
       --input-file llava_instruct_150k.json \
-      --output-file llava_messages.jsonl \
+      --output-file llava_messages.json \
       --image-folder /data/llava_images
 
-Important: use `.jsonl` (one JSON object per line) for ms-swift / merge_shuffle / DuckDB.
-Do NOT read a pretty-printed `.json` array file line-by-line — that causes JSON parse /
-schema errors (e.g. "Expecting property name", "column changed from object to array").
+Output `.json` (top-level array) works with `swift sft --dataset file.json`.
+Only avoid reading a `.json` array **line-by-line** as if it were JSONL.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from json_dataset_io import load_dataset_file, save_dataset_file
 
 try:
     from PIL import Image
@@ -42,33 +42,7 @@ GPT_ROLES = frozenset({'gpt', 'chatgpt', 'assistant', 'bot'})
 
 
 def load_llava_samples(input_path: Path) -> List[Dict[str, Any]]:
-    suffix = input_path.suffix.lower()
-    if suffix == '.jsonl':
-        samples: List[Dict[str, Any]] = []
-        with input_path.open('r', encoding='utf-8') as f:
-            for line_no, line in enumerate(f, start=1):
-                text = line.strip()
-                if not text:
-                    continue
-                row = json.loads(text)
-                if not isinstance(row, dict):
-                    raise ValueError(f'JSONL line {line_no} must be an object')
-                samples.append(row)
-        return samples
-
-    if suffix != '.json':
-        raise ValueError(f'Unsupported input extension: {suffix}. Use .json or .jsonl')
-
-    with input_path.open('r', encoding='utf-8') as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ('data', 'samples', 'records', 'items'):
-            if isinstance(data.get(key), list):
-                return data[key]
-        return [data]
-    raise ValueError(f'Invalid JSON top-level type: {type(data)}')
+    return load_dataset_file(input_path)
 
 
 def content_to_string(content: Any) -> str:
@@ -156,23 +130,6 @@ def validate_jsonl_rows(rows: List[Dict[str, Any]], *, with_shape: bool) -> None
                 raise ValueError(f'Row {idx}: message content must be string, got {type(msg.get("content"))}')
         if with_shape and 'shape' in row and not isinstance(row['shape'], list):
             raise ValueError(f'Row {idx}: shape must be a list when present')
-
-
-def save_samples(output_path: Path, rows: List[Dict[str, Any]], *, compact_json: bool) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = output_path.suffix.lower()
-    if suffix == '.jsonl':
-        with output_path.open('w', encoding='utf-8') as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + '\n')
-        return
-    if suffix != '.json':
-        raise ValueError(f'Unsupported output extension: {suffix}. Use .json or .jsonl')
-    with output_path.open('w', encoding='utf-8') as f:
-        if compact_json:
-            json.dump(rows, f, ensure_ascii=False, separators=(',', ':'))
-        else:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
 
 
 def parse_media_roots(spec: Optional[str]) -> Dict[str, Path]:
@@ -463,11 +420,8 @@ def main() -> None:
         skip_missing_image=args.skip_missing_image,
     )
     output_path = Path(args.output_file)
-    if output_path.suffix.lower() == '.json':
-        print(
-            'Warning: output is .json (one JSON array). Tools that read JSONL line-by-line will fail.\n'
-            '         Prefer .jsonl for swift sft / merge_shuffle_json.py / DuckDB.')
-    save_samples(output_path, converted, compact_json=args.compact_json)
+    indent = 0 if args.compact_json else 2
+    save_dataset_file(output_path, converted, indent=indent)
     print(f'Converted {len(converted)} samples (skipped {skipped}) -> {args.output_file}')
 
 
