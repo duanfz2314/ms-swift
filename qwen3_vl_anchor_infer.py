@@ -21,7 +21,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from swift import BaseArguments, RequestConfig, TransformersEngine, get_template
 from swift.template import history_to_messages
