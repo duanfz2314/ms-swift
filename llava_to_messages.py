@@ -15,6 +15,10 @@ Example:
       --input-file llava_instruct_150k.json \
       --output-file llava_messages.jsonl \
       --image-folder /data/llava_images
+
+Important: use `.jsonl` (one JSON object per line) for ms-swift / merge_shuffle / DuckDB.
+Do NOT read a pretty-printed `.json` array file line-by-line — that causes JSON parse /
+schema errors (e.g. "Expecting property name", "column changed from object to array").
 """
 
 from __future__ import annotations
@@ -67,7 +71,94 @@ def load_llava_samples(input_path: Path) -> List[Dict[str, Any]]:
     raise ValueError(f'Invalid JSON top-level type: {type(data)}')
 
 
-def save_samples(output_path: Path, rows: List[Dict[str, Any]]) -> None:
+def content_to_string(content: Any) -> str:
+    """Flatten HF-style multimodal content lists to a plain string for ms-swift."""
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get('type')
+                if item_type == 'text':
+                    parts.append(str(item.get('text', '')))
+                elif item_type == 'image':
+                    parts.append('<image>')
+                elif item_type == 'video':
+                    parts.append('<video>')
+                else:
+                    parts.append(str(item.get('text') or item.get('content') or item))
+            else:
+                parts.append(str(item))
+        return ''.join(parts)
+    return str(content)
+
+
+def normalize_messages(messages: Any) -> List[Dict[str, str]]:
+    if not isinstance(messages, list) or not messages:
+        raise ValueError('`messages` must be a non-empty list')
+    normalized: List[Dict[str, str]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            raise ValueError(f'Each message must be a dict, got {type(msg)}')
+        role = msg.get('role')
+        if role is None:
+            raise ValueError(f'Message missing role: {msg}')
+        content = msg.get('content')
+        if content is None and 'value' in msg:
+            content = msg.get('value')
+        normalized.append({
+            'role': _normalize_role(str(role)) if str(role).lower() not in {'user', 'assistant', 'system'} else str(role),
+            'content': content_to_string(content),
+        })
+    return normalized
+
+
+def normalize_output_row(row: Dict[str, Any], *, with_shape: bool) -> Dict[str, Any]:
+    """Enforce a stable JSON schema across all rows (avoids DuckDB/pandas type conflicts)."""
+    out: Dict[str, Any] = {}
+    if 'id' in row:
+        out['id'] = str(row['id'])
+    out['messages'] = normalize_messages(row['messages'])
+    images = row.get('images')
+    if isinstance(images, str):
+        images = [images]
+    elif not isinstance(images, list):
+        images = [str(images)] if images is not None else []
+    out['images'] = [str(p) for p in images]
+    anchors = row.get('anchors', DEFAULT_ANCHORS)
+    if not isinstance(anchors, list):
+        anchors = list(anchors) if isinstance(anchors, (tuple,)) else DEFAULT_ANCHORS
+    out['anchors'] = [int(x) for x in anchors[:4]] + [0] * max(0, 4 - len(anchors))
+    out['anchors'] = out['anchors'][:4]
+    out['anchor_type'] = int(row.get('anchor_type', DEFAULT_ANCHOR_TYPE))
+    if with_shape:
+        shape = row.get('shape')
+        if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+            out['shape'] = [int(shape[0]), int(shape[1])]
+    return out
+
+
+def validate_jsonl_rows(rows: List[Dict[str, Any]], *, with_shape: bool) -> None:
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f'Row {idx}: must be a dict')
+        if not isinstance(row.get('messages'), list):
+            raise ValueError(f'Row {idx}: messages must be a list')
+        if not isinstance(row.get('images'), list):
+            raise ValueError(f'Row {idx}: images must be a list, got {type(row.get("images"))}')
+        if not isinstance(row.get('anchors'), list):
+            raise ValueError(f'Row {idx}: anchors must be a list, got {type(row.get("anchors"))}')
+        for msg in row['messages']:
+            if not isinstance(msg.get('content'), str):
+                raise ValueError(f'Row {idx}: message content must be string, got {type(msg.get("content"))}')
+        if with_shape and 'shape' in row and not isinstance(row['shape'], list):
+            raise ValueError(f'Row {idx}: shape must be a list when present')
+
+
+def save_samples(output_path: Path, rows: List[Dict[str, Any]], *, compact_json: bool) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
     if suffix == '.jsonl':
@@ -78,7 +169,10 @@ def save_samples(output_path: Path, rows: List[Dict[str, Any]]) -> None:
     if suffix != '.json':
         raise ValueError(f'Unsupported output extension: {suffix}. Use .json or .jsonl')
     with output_path.open('w', encoding='utf-8') as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
+        if compact_json:
+            json.dump(rows, f, ensure_ascii=False, separators=(',', ':'))
+        else:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
 
 
 def parse_media_roots(spec: Optional[str]) -> Dict[str, Path]:
@@ -167,9 +261,9 @@ def conversations_to_messages(conversations: List[Dict[str, Any]]) -> List[Dict[
         # ShareGPT-style in conversations: {human, assistant}
         if 'human' in turn or 'assistant' in turn:
             if turn.get('human') is not None:
-                messages.append({'role': 'user', 'content': str(turn['human'])})
+                messages.append({'role': 'user', 'content': content_to_string(turn['human'])})
             if turn.get('assistant') is not None:
-                messages.append({'role': 'assistant', 'content': str(turn['assistant'])})
+                messages.append({'role': 'assistant', 'content': content_to_string(turn['assistant'])})
             continue
         role_raw = turn.get('from') or turn.get('role')
         content = turn.get('value')
@@ -177,7 +271,10 @@ def conversations_to_messages(conversations: List[Dict[str, Any]]) -> List[Dict[
             content = turn.get('content')
         if role_raw is None or content is None:
             raise ValueError(f'Invalid conversation turn (need from/role + value/content): {turn}')
-        messages.append({'role': _normalize_role(str(role_raw)), 'content': str(content)})
+        messages.append({
+            'role': _normalize_role(str(role_raw)),
+            'content': content_to_string(content),
+        })
     if not messages:
         raise ValueError('Empty conversations')
     return messages
@@ -234,7 +331,7 @@ def convert_llava_row(
         item['id'] = row['id']
 
     if 'messages' in row:
-        item['messages'] = row['messages']
+        item['messages'] = normalize_messages(row['messages'])
     elif _is_llava_conversation_row(row):
         item['messages'] = conversations_to_messages(row['conversations'])
     elif _is_pretrain_row(row):
@@ -299,7 +396,8 @@ def convert_dataset(
         if skip_missing_image and out['images'] and not os.path.isfile(out['images'][0]):
             skipped += 1
             continue
-        converted.append(out)
+        converted.append(normalize_output_row(out, with_shape=with_shape))
+    validate_jsonl_rows(converted, with_shape=with_shape)
     return converted, skipped
 
 
@@ -337,6 +435,10 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Skip samples whose resolved image path does not exist.')
     parser.add_argument('--limit', type=int, default=None, help='Convert at most N samples (debug).')
+    parser.add_argument(
+        '--compact-json',
+        action='store_true',
+        help='When writing .json (array), use compact single-line array instead of indent=2.')
     return parser.parse_args()
 
 
@@ -360,7 +462,12 @@ def main() -> None:
         keep_id=args.keep_id,
         skip_missing_image=args.skip_missing_image,
     )
-    save_samples(Path(args.output_file), converted)
+    output_path = Path(args.output_file)
+    if output_path.suffix.lower() == '.json':
+        print(
+            'Warning: output is .json (one JSON array). Tools that read JSONL line-by-line will fail.\n'
+            '         Prefer .jsonl for swift sft / merge_shuffle_json.py / DuckDB.')
+    save_samples(output_path, converted, compact_json=args.compact_json)
     print(f'Converted {len(converted)} samples (skipped {skipped}) -> {args.output_file}')
 
 
