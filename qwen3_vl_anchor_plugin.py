@@ -13,9 +13,11 @@ anchor_type:
     1 -> crop by anchors
     2 -> draw rectangle by anchors
 
-Multi-video / multi-turn (align with <video>/<image> order in messages):
-    "anchors": [[x1,y1,x2,y2], [x1,y1,x2,y2]],
-    "anchor_type": [1, 2]
+anchors / anchor_type (default: message-order / 全局混排):
+    List boxes in the same order as <image>/<video> appear in the conversation
+    (left-to-right in messages), e.g. image then video then video -> anchors[0..2].
+    "anchors_align": "per_media" restores legacy per-type indexing (images[0] and
+    videos[0] both use anchors[0]).
     A flat 4-number "anchors" box applies to every media item.
 
 Training augmentations (on by default when is_training; off at inference):
@@ -142,6 +144,59 @@ def _get_anchors_from_inputs(inputs) -> Any:
     if anchors is None:
         anchors = inputs.extra_kwargs.get('anchor')
     return anchors
+
+
+ANCHOR_ALIGN_MESSAGE_ORDER = 'message_order'
+ANCHOR_ALIGN_PER_MEDIA = 'per_media'
+
+
+def _anchors_align_mode(inputs) -> str:
+    mode = inputs.extra_kwargs.get('anchors_align', ANCHOR_ALIGN_MESSAGE_ORDER)
+    if isinstance(mode, str):
+        mode = mode.strip().lower()
+    if mode in {'global', 'message', 'message_order', 'order'}:
+        return ANCHOR_ALIGN_MESSAGE_ORDER
+    if mode in {ANCHOR_ALIGN_PER_MEDIA, 'per_type', 'media'}:
+        return ANCHOR_ALIGN_PER_MEDIA
+    logger.warning_once(f'Unknown anchors_align={mode!r}, fallback to {ANCHOR_ALIGN_MESSAGE_ORDER}')
+    return ANCHOR_ALIGN_MESSAGE_ORDER
+
+
+def _build_anchor_index_map(context_list: List[Any]) -> Dict[str, Dict[int, int]]:
+    """Map (media_type, local_index) -> global anchor index by tag order in context_list."""
+    image_map: Dict[int, int] = {}
+    video_map: Dict[int, int] = {}
+    image_i = 0
+    video_i = 0
+    global_i = 0
+    for context in context_list:
+        if context == '<image>':
+            image_map[image_i] = global_i
+            image_i += 1
+            global_i += 1
+        elif context == '<video>':
+            video_map[video_i] = global_i
+            video_i += 1
+            global_i += 1
+    return {'image': image_map, 'video': video_map}
+
+
+def _init_anchor_index_map(context_list: List[Any], inputs) -> None:
+    inputs._anchor_index_map = _build_anchor_index_map(context_list)
+
+
+def _resolve_anchor_pick_index(media_type: str, index: int, inputs) -> int:
+    if _anchors_align_mode(inputs) == ANCHOR_ALIGN_PER_MEDIA:
+        return index
+    index_map = getattr(inputs, '_anchor_index_map', None)
+    if not index_map:
+        return index
+    per_type = index_map.get(media_type) or {}
+    if index in per_type:
+        return per_type[index]
+    logger.warning_once(
+        f'No message-order anchor slot for {media_type}[{index}]; fallback to anchors[{index}].')
+    return index
 
 
 def _augment_flag(inputs, extra_key: str, env_key: str, *, is_training: bool, default_in_training: bool = True) -> bool:
@@ -672,13 +727,18 @@ def _apply_anchor_to_video(video: Any,
 
 class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
+    def _pre_tokenize_images(self, context_list, loss_scale_list, inputs):
+        # Build global anchor index map before any replace_tag (images run before videos in swift).
+        _init_anchor_index_map(context_list, inputs)
+        return super()._pre_tokenize_images(context_list, loss_scale_list, inputs)
+
     @staticmethod
     def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, str]:
-        _ = media_type
-        anchor_type_raw = _pick_by_index(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), index,
-                                         ANCHOR_TYPE_NONE)
+        pick_index = _resolve_anchor_pick_index(media_type, index, inputs)
+        anchor_type_raw = _pick_by_index(
+            inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), pick_index, ANCHOR_TYPE_NONE)
         anchor_type = _normalize_anchor_type(anchor_type_raw)
-        anchor = _pick_by_index(_get_anchors_from_inputs(inputs), index)
+        anchor = _pick_by_index(_get_anchors_from_inputs(inputs), pick_index)
         # [0,0,0,0] means "no crop", but draw mode should still draw it.
         if anchor_type == ANCHOR_TYPE_CROP and _is_noop_anchor(anchor):
             anchor = None
