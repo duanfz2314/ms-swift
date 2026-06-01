@@ -12,13 +12,20 @@ anchor_type:
     0 -> no processing
     1 -> crop by anchors
     2 -> draw rectangle by anchors
+
+Training augmentations (enabled by default in training mode):
+    anchor_frame_augment / ANCHOR_FRAME_AUGMENT:
+        Randomly subsample video frames; count in [ceil(n*anchor_frame_min_ratio), n].
+    anchor_expand_augment / ANCHOR_EXPAND_AUGMENT:
+        Randomly expand anchors around center; scale in [1, 1+anchor_expand_max_ratio].
 """
 
 import math
 import os
+import random
 import time
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -29,7 +36,7 @@ from torchvision.transforms import InterpolationMode
 from swift.template import register_template
 from swift.template.base import Template
 from swift.template.templates.qwen import Qwen3VLTemplate, QwenTemplateMeta
-from swift.utils import get_logger
+from swift.utils import get_env_args, get_logger
 
 logger = get_logger()
 TEMPLATE_TYPE = 'qwen3_vl_anchor'
@@ -103,6 +110,82 @@ def _parse_shape_wh(shape: Any) -> Optional[Tuple[int, int]]:
     if w <= 0 or h <= 0:
         return None
     return w, h
+
+
+def _pick_by_index(value: Any, index: int, default: Any = None) -> Any:
+    if isinstance(value, (list, tuple)) and value:
+        if isinstance(value[0], (list, tuple)):
+            return value[index] if index < len(value) else value[-1]
+        if all(not isinstance(v, (list, tuple)) for v in value):
+            return value[index] if index < len(value) else value[-1]
+    return value if value is not None else default
+
+
+def _augment_flag(inputs, extra_key: str, env_key: str, *, is_training: bool, default_in_training: bool = True) -> bool:
+    raw = inputs.extra_kwargs.get(extra_key)
+    if raw is not None:
+        return _to_bool(raw)
+    if not is_training:
+        return False
+    return get_env_args(env_key, bool, default_in_training)
+
+
+def _random_expand_anchor(anchor: Any,
+                          width: int,
+                          height: int,
+                          *,
+                          max_expand_ratio: float = 1.0) -> Any:
+    """Expand xyxy anchor around its center by up to max_expand_ratio of its size."""
+    if _is_noop_anchor(anchor) or max_expand_ratio <= 0:
+        return anchor
+    if not isinstance(anchor, (list, tuple)) or len(anchor) < 4:
+        return anchor
+    try:
+        x1, y1, x2, y2 = (float(anchor[0]), float(anchor[1]), float(anchor[2]), float(anchor[3]))
+    except Exception:
+        return anchor
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    w = max(x2 - x1, 1.0)
+    h = max(y2 - y1, 1.0)
+    scale = 1.0 + random.random() * max_expand_ratio
+    half_w = w * scale / 2.0
+    half_h = h * scale / 2.0
+    nx1 = max(0.0, cx - half_w)
+    ny1 = max(0.0, cy - half_h)
+    nx2 = min(float(width), cx + half_w)
+    ny2 = min(float(height), cy + half_h)
+    if nx2 <= nx1 or ny2 <= ny1:
+        return list(anchor[:4])
+    return [nx1, ny1, nx2, ny2]
+
+
+def _align_frame_count(n: int, frame_factor: int) -> int:
+    return max(frame_factor, _ceil_by_factor(n, frame_factor))
+
+
+def _random_subsample_video(video: torch.Tensor,
+                            video_metadata: Optional[Dict[str, Any]] = None,
+                            *,
+                            min_ratio: float = 0.5,
+                            frame_factor: int = 2) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+    """Randomly subsample frames; keep temporal order and respect frame_factor."""
+    nframes = int(video.shape[0])
+    if nframes <= frame_factor:
+        return video, video_metadata
+    min_frames = _align_frame_count(max(1, int(math.floor(nframes * min_ratio))), frame_factor)
+    min_frames = min(min_frames, nframes)
+    if min_frames >= nframes:
+        return video, video_metadata
+    target = random.randint(min_frames, nframes)
+    target = min(_align_frame_count(target, frame_factor), nframes)
+    indices = sorted(random.sample(range(nframes), target))
+    out = video[indices]
+    meta = dict(video_metadata) if isinstance(video_metadata, dict) else None
+    if meta is not None and isinstance(meta.get('frames_indices'), list):
+        orig = meta['frames_indices']
+        meta['frames_indices'] = [orig[i] if i < len(orig) else i for i in indices]
+    return out, meta
 
 
 def _normalize_anchor(anchor: Any,
@@ -368,6 +451,15 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
             total_num_frames=(nframes / sample_fps) * raw_fps,
             video_backend='frame_list')
 
+    frame_augment = ele.pop('_frame_augment', False)
+    frame_min_ratio = float(ele.pop('_frame_min_ratio', 0.5))
+    if frame_augment:
+        video, video_metadata = _random_subsample_video(
+            video,
+            video_metadata,
+            min_ratio=frame_min_ratio,
+            frame_factor=frame_factor)
+
     # Anchor ops are based on absolute coordinates from original media.
     # Apply before resize to avoid coordinate drift.
     if anchor is not None and anchor_type in {ANCHOR_TYPE_CROP, ANCHOR_TYPE_DRAW}:
@@ -546,20 +638,21 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
 
     @staticmethod
     def _get_shape_wh(inputs, media_type: str, index: int) -> Optional[Tuple[int, int]]:
-        _ = index  # shape is a single list [w, h] under current data contract.
         if media_type == 'image':
             shape_raw = inputs.extra_kwargs.get('image_shape')
         else:
             shape_raw = inputs.extra_kwargs.get('video_shape')
         if shape_raw is None:
             shape_raw = inputs.extra_kwargs.get('shape')
+        shape_raw = _pick_by_index(shape_raw, index)
         return _parse_shape_wh(shape_raw)
 
     @staticmethod
     def _collect_anchor_info(media_type: str, index: int, inputs) -> Tuple[Any, int, Optional[Tuple[int, int]], str]:
-        _ = media_type, index  # keep signature stable; inputs are scalar/list for current sample.
-        anchor_type = _normalize_anchor_type(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE))
-        anchor = inputs.extra_kwargs.get('anchors')
+        anchor_type_raw = _pick_by_index(inputs.extra_kwargs.get('anchor_type', ANCHOR_TYPE_NONE), index,
+                                         ANCHOR_TYPE_NONE)
+        anchor_type = _normalize_anchor_type(anchor_type_raw)
+        anchor = _pick_by_index(inputs.extra_kwargs.get('anchors'), index)
         # [0,0,0,0] means "no crop", but draw mode should still draw it.
         if anchor_type == ANCHOR_TYPE_CROP and _is_noop_anchor(anchor):
             anchor = None
@@ -567,12 +660,35 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         shape_wh = Qwen3VLAnchorTemplate._get_shape_wh(inputs, media_type, index)
         return anchor, anchor_type, shape_wh, 'xyxy'
 
+    def _maybe_augment_anchor(self, anchor: Any, anchor_type: int, shape_wh: Optional[Tuple[int, int]],
+                              inputs) -> Any:
+        if anchor is None or not _has_anchor_operation(anchor, anchor_type):
+            return anchor
+        if not _augment_flag(inputs, 'anchor_expand_augment', 'ANCHOR_EXPAND_AUGMENT', is_training=self.is_training):
+            return anchor
+        if shape_wh is None:
+            logger.warning_once('anchor_expand_augment skipped: shape/video_shape/image_shape is not set.')
+            return anchor
+        max_ratio = inputs.extra_kwargs.get('anchor_expand_max_ratio')
+        if max_ratio is None:
+            max_ratio = get_env_args('ANCHOR_EXPAND_MAX_RATIO', float, 1.0)
+        return _random_expand_anchor(anchor, shape_wh[0], shape_wh[1], max_expand_ratio=float(max_ratio))
+
+    def _video_augment_kwargs(self, inputs) -> Dict[str, Any]:
+        if not _augment_flag(inputs, 'anchor_frame_augment', 'ANCHOR_FRAME_AUGMENT', is_training=self.is_training):
+            return {}
+        min_ratio = inputs.extra_kwargs.get('anchor_frame_min_ratio')
+        if min_ratio is None:
+            min_ratio = get_env_args('ANCHOR_FRAME_MIN_RATIO', float, 0.5)
+        return {'_frame_augment': True, '_frame_min_ratio': float(min_ratio)}
+
     @staticmethod
     def _append_anchor_kwargs(media_type: str, inputs, anchor: Any, anchor_type: int) -> None:
         if anchor is None:
             return
         inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchors', []).append(anchor)
-        inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_type', anchor_type)
+        anchor_types = inputs.mm_processor_kwargs.setdefault(f'{media_type}_anchor_types', [])
+        anchor_types.append(anchor_type)
 
     def _build_fetch_kwargs(self, inputs) -> Dict[str, Any]:
         kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
@@ -632,9 +748,22 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
             return ['<|vision_start|>', [-100], '<|vision_end|>']
         return ['<|vision_start|><|image_pad|><|vision_end|>']
 
+    def _apply_loaded_video_augment(self, video: Any, video_metadata: Optional[Dict[str, Any]], inputs):
+        if not _augment_flag(inputs, 'anchor_frame_augment', 'ANCHOR_FRAME_AUGMENT', is_training=self.is_training):
+            return video, video_metadata
+        if not isinstance(video, torch.Tensor) or video.ndim != 4:
+            return video, video_metadata
+        min_ratio = inputs.extra_kwargs.get('anchor_frame_min_ratio')
+        if min_ratio is None:
+            min_ratio = get_env_args('ANCHOR_FRAME_MIN_RATIO', float, 0.5)
+        frame_factor = int(_get_qwen_vl_constant('FRAME_FACTOR', 2))
+        return _random_subsample_video(
+            video, video_metadata, min_ratio=float(min_ratio), frame_factor=frame_factor)
+
     def _replace_video_tag(self, index: int, inputs, anchor: Any, anchor_type: int, shape_wh, anchor_format: str,
                            fetch_kwargs: Dict[str, Any]):
         video_fetch_kwargs = dict(fetch_kwargs)
+        video_fetch_kwargs.update(self._video_augment_kwargs(inputs))
         if self.version == 'v3':
             video_fetch_kwargs['return_video_metadata'] = True
         video = inputs.videos[index]
@@ -654,6 +783,12 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         else:
             from qwen_vl_utils import fetch_video
             video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **video_fetch_kwargs)
+            if isinstance(video, tuple) and len(video) == 2 and isinstance(video[0], torch.Tensor):
+                video_tensor, video_metadata = video
+                video_tensor, video_metadata = self._apply_loaded_video_augment(video_tensor, video_metadata, inputs)
+                video = (video_tensor, video_metadata)
+            elif isinstance(video, torch.Tensor):
+                video, _ = self._apply_loaded_video_augment(video, None, inputs)
 
         tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
         if self.version == 'v2_5':
@@ -674,6 +809,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         if media_type not in {'image', 'video'}:
             return super().replace_tag(media_type, index, inputs)
         anchor, anchor_type, shape_wh, anchor_format = self._collect_anchor_info(media_type, index, inputs)
+        anchor = self._maybe_augment_anchor(anchor, anchor_type, shape_wh, inputs)
         self._append_anchor_kwargs(media_type, inputs, anchor, anchor_type)
         fetch_kwargs = self._build_fetch_kwargs(inputs)
         if media_type == 'image':
