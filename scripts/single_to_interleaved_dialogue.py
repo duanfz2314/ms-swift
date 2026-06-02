@@ -11,6 +11,10 @@ Example:
         --output data/interleaved.jsonl \\
         --seed 42
 
+Output format:
+    - .jsonl  -> one JSON object per line (use with swift sft --dataset ...)
+    - .json   -> one JSON array file (use json.load); do NOT json.load a .jsonl file
+
 Input (single-turn, messages form):
     {"messages": [{"role": "user", "content": "<video>Q1"}, {"role": "assistant", "content": "A1"}],
      "videos": ["a.mp4"], "anchors": [[1,2,3,4]], "anchor_type": 1}
@@ -77,11 +81,21 @@ def _load_records(path: Path) -> List[JsonDict]:
     raise ValueError(f'{path}: root must be object or array')
 
 
-def _write_jsonl(path: Path, records: Sequence[JsonDict]) -> None:
+def _write_records(path: Path, records: Sequence[JsonDict]) -> None:
+    """Write records: .jsonl => one JSON object per line; .json => a single JSON array."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = path.suffix.lower()
     with path.open('w', encoding='utf-8') as f:
-        for row in records:
-            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        if suffix == '.jsonl':
+            for row in records:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        elif suffix == '.json':
+            json.dump(list(records), f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        else:
+            # Default to JSONL (ms-swift dataset convention).
+            for row in records:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
 def _normalize_single_turn(record: JsonDict) -> JsonDict:
@@ -300,7 +314,13 @@ def build_interleaved_dataset(
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--input', '-i', type=Path, required=True, help='Input .json or .jsonl (single-turn rows)')
-    p.add_argument('--output', '-o', type=Path, required=True, help='Output .jsonl path')
+    p.add_argument(
+        '--output',
+        '-o',
+        type=Path,
+        required=True,
+        help='Output path: .jsonl = one sample per line (recommended for swift sft); '
+        '.json = single JSON array')
     p.add_argument('--seed', type=int, default=42, help='Random seed for shuffle and group sizes')
     p.add_argument('--min-rounds', type=int, default=1, help='Min single-turn rows merged per output sample')
     p.add_argument('--max-rounds', type=int, default=3, help='Max single-turn rows merged per output sample')
@@ -324,14 +344,15 @@ def main() -> None:
         ensure_tags=not args.no_media_tags,
     )
 
-    _write_jsonl(args.output, merged)
+    _write_records(args.output, merged)
 
     in_n = len(records)
     out_n = len(merged)
     ratio = out_n / in_n if in_n else 0
+    fmt = 'JSON array' if args.output.suffix.lower() == '.json' else 'JSONL (one sample per line)'
     print(f'Input samples:  {in_n}')
     print(f'Output samples: {out_n} ({ratio:.2%} of input, ~1/{in_n/out_n:.1f} if >0)')
-    print(f'Written: {args.output}')
+    print(f'Written ({fmt}): {args.output}')
 
 
 if __name__ == '__main__':
