@@ -519,6 +519,10 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
                             return_video_sample_fps: bool = False,
                             return_video_metadata: bool = False,
                             anchor_format: str = 'xyxy') -> Any:
+    # Internal keys live on ele, not in function kwargs.
+    frame_augment = ele.pop('_frame_augment', False)
+    frame_min_ratio = float(ele.pop('_frame_min_ratio', 0.5))
+
     image_factor = image_patch_size * _get_qwen_vl_constant('SPATIAL_MERGE_SIZE', 2)
     video_min_token_num = _get_qwen_vl_constant('VIDEO_MIN_TOKEN_NUM', 128)
     video_max_token_num = _get_qwen_vl_constant('VIDEO_MAX_TOKEN_NUM', 768)
@@ -551,8 +555,6 @@ def fetch_video_with_anchor(ele: Dict[str, Any],
             total_num_frames=(nframes / sample_fps) * raw_fps,
             video_backend='frame_list')
 
-    frame_augment = ele.pop('_frame_augment', False)
-    frame_min_ratio = float(ele.pop('_frame_min_ratio', 0.5))
     if frame_augment:
         video, video_metadata = _random_subsample_video(
             video,
@@ -860,13 +862,14 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
     def _replace_video_tag(self, index: int, inputs, anchor: Any, anchor_type: int, anchor_format: str,
                            fetch_kwargs: Dict[str, Any]):
         video_fetch_kwargs = dict(fetch_kwargs)
-        video_fetch_kwargs.update(self._video_augment_kwargs(inputs))
         if self.version == 'v3':
             video_fetch_kwargs['return_video_metadata'] = True
         video = inputs.videos[index]
         video_inputs = {'video': video}
         if isinstance(video, list):  # image list
             video_inputs['sample_fps'] = _get_qwen_vl_constant('FPS', 2.0)
+        # Frame augment flags are read from ele inside fetch_video_with_anchor, not as kwargs.
+        video_inputs.update(self._video_augment_kwargs(inputs))
 
         if _has_anchor_operation(anchor, anchor_type):
             video, video_kwargs = fetch_video_with_anchor(
