@@ -81,21 +81,58 @@ def _load_records(path: Path) -> List[JsonDict]:
     raise ValueError(f'{path}: root must be object or array')
 
 
-def _write_records(path: Path, records: Sequence[JsonDict]) -> None:
-    """Write records: .jsonl => one JSON object per line; .json => a single JSON array."""
+def _resolve_output_format(path: Path, fmt: str) -> str:
+    """Return 'json' (one array file) or 'jsonl' (one object per line)."""
+    fmt = (fmt or 'auto').strip().lower()
+    if fmt in {'json', 'array'}:
+        return 'json'
+    if fmt in {'jsonl', 'jsonlines', 'lines'}:
+        return 'jsonl'
+    if fmt != 'auto':
+        raise ValueError(f'Unknown --format {fmt!r}, use auto|json|jsonl')
+    return 'json' if path.suffix.lower() == '.json' else 'jsonl'
+
+
+def _assert_json_array_file(path: Path) -> None:
+    """Ensure file is one JSON array so json.load works (not JSONL)."""
+    raw = path.read_text(encoding='utf-8').strip()
+    if not raw:
+        raise ValueError(f'{path}: empty file')
+    if not raw.startswith('['):
+        raise ValueError(
+            f'{path}: expected JSON array starting with "[", got {raw[:40]!r}... '
+            '(file may be JSONL; use .jsonl extension or --format jsonl)')
+    if not raw.endswith(']'):
+        raise ValueError(f'{path}: expected JSON array ending with "]", got ...{raw[-40:]!r}')
+    json.loads(raw)
+
+
+def _write_jsonl(path: Path, records: Sequence[JsonDict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
     with path.open('w', encoding='utf-8') as f:
-        if suffix == '.jsonl':
-            for row in records:
-                f.write(json.dumps(row, ensure_ascii=False) + '\n')
-        elif suffix == '.json':
-            json.dump(list(records), f, ensure_ascii=False, indent=2)
-            f.write('\n')
-        else:
-            # Default to JSONL (ms-swift dataset convention).
-            for row in records:
-                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        for row in records:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+
+def _write_json_array(path: Path, records: Sequence[JsonDict]) -> None:
+    """Write all samples as one JSON array [...] (valid for json.load)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = list(records)
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if not text.startswith('['):
+        text = '[' + text + ']'
+    path.write_text(text + '\n', encoding='utf-8')
+    _assert_json_array_file(path)
+
+
+def _write_records(path: Path, records: Sequence[JsonDict], *, output_format: str = 'auto') -> str:
+    """Write records; return resolved format name ('json' or 'jsonl')."""
+    fmt = _resolve_output_format(path, output_format)
+    if fmt == 'json':
+        _write_json_array(path, records)
+    else:
+        _write_jsonl(path, records)
+    return fmt
 
 
 def _normalize_single_turn(record: JsonDict) -> JsonDict:
@@ -320,7 +357,13 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help='Output path: .jsonl = one sample per line (recommended for swift sft); '
-        '.json = single JSON array')
+        '.json = one JSON array wrapped in [...]')
+    p.add_argument(
+        '--format',
+        choices=('auto', 'json', 'jsonl'),
+        default='auto',
+        help='auto: .json -> array [...], .jsonl -> one object per line; '
+        'json/jsonl override extension')
     p.add_argument('--seed', type=int, default=42, help='Random seed for shuffle and group sizes')
     p.add_argument('--min-rounds', type=int, default=1, help='Min single-turn rows merged per output sample')
     p.add_argument('--max-rounds', type=int, default=3, help='Max single-turn rows merged per output sample')
@@ -344,15 +387,18 @@ def main() -> None:
         ensure_tags=not args.no_media_tags,
     )
 
-    _write_records(args.output, merged)
+    written_fmt = _write_records(args.output, merged, output_format=args.format)
 
     in_n = len(records)
     out_n = len(merged)
     ratio = out_n / in_n if in_n else 0
-    fmt = 'JSON array' if args.output.suffix.lower() == '.json' else 'JSONL (one sample per line)'
+    fmt_desc = 'JSON array [...]' if written_fmt == 'json' else 'JSONL (one sample per line)'
     print(f'Input samples:  {in_n}')
     print(f'Output samples: {out_n} ({ratio:.2%} of input, ~1/{in_n/out_n:.1f} if >0)')
-    print(f'Written ({fmt}): {args.output}')
+    print(f'Written ({fmt_desc}): {args.output}')
+    if written_fmt == 'json':
+        head = args.output.read_text(encoding='utf-8').lstrip()[:1]
+        print(f'Verified: file starts with {head!r} (json.load OK)')
 
 
 if __name__ == '__main__':
