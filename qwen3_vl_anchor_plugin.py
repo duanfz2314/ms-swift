@@ -20,10 +20,16 @@ anchors / anchor_type (default: message-order / 全局混排):
     videos[0] both use anchors[0]).
     A flat 4-number "anchors" box applies to every media item.
 
-Training augmentations (on by default when is_training; off at inference):
-    anchor_frame_augment: random video frame subsampling in [ceil(n*0.5), n]
-    anchor_expand_augment: random anchor box expansion up to 100% outward
-    Set anchor_frame_augment / anchor_expand_augment to false in jsonl to disable per sample.
+Training augmentations (train forward only by default; disabled in eval / infer):
+    ANCHOR_AUGMENT=0 disables both frame + expand augmentations globally.
+    ANCHOR_FRAME_AUGMENT / ANCHOR_EXPAND_AUGMENT: per-type env overrides (0=off, 1=on).
+    anchor_frame_augment / anchor_expand_augment in jsonl override env for that sample.
+    During swift sft validation, augment is off when model.eval() even if template.mode is train.
+
+    Val vs offline test mismatch checklist:
+    - Set both ANCHOR_FRAME_AUGMENT=0 and ANCHOR_EXPAND_AUGMENT=0 (expand=0 alone still allows random frames).
+    - Re-encode dataset if using cached_dataset (old cache may contain augmented media).
+    - Val loss uses teacher forcing; offline test often uses generation (not comparable directly).
 """
 
 import math
@@ -199,13 +205,48 @@ def _resolve_anchor_pick_index(media_type: str, index: int, inputs) -> int:
     return index
 
 
-def _augment_flag(inputs, extra_key: str, env_key: str, *, is_training: bool, default_in_training: bool = True) -> bool:
+def _env_flag(env_key: str) -> Optional[bool]:
+    """Read bool env var; None if unset."""
+    raw = os.getenv(env_key.upper())
+    if raw is None:
+        return None
+    return _to_bool(raw)
+
+
+def _master_augment_disabled() -> bool:
+    """ANCHOR_AUGMENT=0 disables all random augmentations."""
+    flag = _env_flag('ANCHOR_AUGMENT')
+    return flag is not None and not flag
+
+
+def _augment_flag(template: 'Qwen3VLAnchorTemplate',
+                  inputs,
+                  extra_key: str,
+                  env_key: str,
+                  *,
+                  default_in_training: bool = True) -> bool:
+    """Whether to apply random augmentation for this sample.
+
+    Priority: per-sample extra_kwargs > env ANCHOR_* > model.eval() off > template infer mode off > train default.
+    """
+    if _master_augment_disabled():
+        return False
     raw = inputs.extra_kwargs.get(extra_key)
     if raw is not None:
         return _to_bool(raw)
-    if not is_training:
+    env_val = _env_flag(env_key)
+    if env_val is not None:
+        return env_val
+    model = getattr(template, 'model', None)
+    if model is not None and hasattr(model, 'training') and not model.training:
         return False
-    return get_env_args(env_key, bool, default_in_training)
+    if not template.is_training:
+        return False
+    if default_in_training:
+        logger.warning_once(
+            f'{env_key} is unset; random augmentation enabled during train forward. '
+            f'Set export {env_key}=0 to disable, or export ANCHOR_AUGMENT=0 for both.')
+    return default_in_training
 
 
 def _random_expand_anchor(anchor: Any,
@@ -750,12 +791,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
     def _maybe_augment_anchor(self, anchor: Any, anchor_type: int, media_type: str, index: int, inputs) -> Any:
         if anchor is None or not _has_anchor_operation(anchor, anchor_type):
             return anchor
-        if not _augment_flag(
-                inputs,
-                'anchor_expand_augment',
-                'ANCHOR_EXPAND_AUGMENT',
-                is_training=self.is_training,
-                default_in_training=True):
+        if not _augment_flag(self, inputs, 'anchor_expand_augment', 'ANCHOR_EXPAND_AUGMENT', default_in_training=True):
             return anchor
         bounds = _probe_media_size_wh(media_type, index, inputs)
         width, height = (bounds if bounds else (None, None))
@@ -765,12 +801,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         return _random_expand_anchor(anchor, width, height, max_expand_ratio=float(max_ratio))
 
     def _video_augment_kwargs(self, inputs) -> Dict[str, Any]:
-        if not _augment_flag(
-                inputs,
-                'anchor_frame_augment',
-                'ANCHOR_FRAME_AUGMENT',
-                is_training=self.is_training,
-                default_in_training=True):
+        if not _augment_flag(self, inputs, 'anchor_frame_augment', 'ANCHOR_FRAME_AUGMENT', default_in_training=True):
             return {}
         min_ratio = inputs.extra_kwargs.get('anchor_frame_min_ratio')
         if min_ratio is None:
@@ -843,12 +874,7 @@ class Qwen3VLAnchorTemplate(Qwen3VLTemplate):
         return ['<|vision_start|><|image_pad|><|vision_end|>']
 
     def _apply_loaded_video_augment(self, video: Any, video_metadata: Optional[Dict[str, Any]], inputs):
-        if not _augment_flag(
-                inputs,
-                'anchor_frame_augment',
-                'ANCHOR_FRAME_AUGMENT',
-                is_training=self.is_training,
-                default_in_training=True):
+        if not _augment_flag(self, inputs, 'anchor_frame_augment', 'ANCHOR_FRAME_AUGMENT', default_in_training=True):
             return video, video_metadata
         if not isinstance(video, torch.Tensor) or video.ndim != 4:
             return video, video_metadata
